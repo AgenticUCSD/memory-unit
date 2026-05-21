@@ -1,0 +1,428 @@
+"""
+FastAPI endpoints for the Memory Unit.
+
+Provides HTTP interface for:
+- Hydrating memory from Google Drive
+- Querying for context
+- Context injection endpoints for Extension, Task Identifier, Workflow Builder
+
+Auth token flow (from Chrome extension):
+- Extension gets token via chrome.identity.getAuthToken()
+- Sends in Authorization: Bearer <token> header
+- Also sends X-User-Id and X-Thread-Id headers
+"""
+
+from typing import Optional, Dict, Any, List
+import os
+import logging
+
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from memory_unit import MemoryUnit, ContextQueryResult, DriveFolderConfig
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI(
+    title="Agentic RAG Memory Unit API",
+    description="Memory unit with Google Drive integration and agentic RAG",
+    version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global memory unit instance
+_memory_unit: Optional[MemoryUnit] = None
+
+
+# =============================================================================
+# Pydantic Models
+# =============================================================================
+
+class HydrateRequest(BaseModel):
+    root_folder_id: str = Field(..., description="Root Drive folder ID with 2 subfolders")
+    persist_dir: Optional[str] = Field(None, description="Chroma persistence directory")
+    model_name: str = Field("gpt-4o", description="OpenAI model for agent")
+
+
+class HydrateResponse(BaseModel):
+    status: str
+    documents_indexed: int
+    folder_structure: Dict[str, Any]
+    stats: Dict[str, Any]
+
+
+class QueryRequest(BaseModel):
+    query: str = Field(..., description="Query text to retrieve context")
+    n_results: int = Field(5, description="Number of results to retrieve")
+
+
+class ContextResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]]
+    context_for_extension: str
+    context_for_task_identifier: str
+    context_for_workflow_builder: str
+
+    # Machine-generated preference data
+    user_preferences: List[str] = []
+    task_patterns: List[str] = []
+    workflow_trends: List[str] = []
+
+
+class ExtensionContextRequest(BaseModel):
+    query: str
+
+
+class TaskIdentifierContextRequest(BaseModel):
+    task_description: str
+
+
+class WorkflowBuilderContextRequest(BaseModel):
+    task_description: str
+
+
+class PreferencesResponse(BaseModel):
+    user_preferences: List[str]
+    task_patterns: List[str]
+    workflow_trends: List[str]
+
+
+class StatsResponse(BaseModel):
+    is_hydrated: bool
+    total_documents: int
+    vector_store_count: int
+    keyword_index_size: int
+
+
+class HealthResponse(BaseModel):
+    status: str
+    memory_unit_initialized: bool
+    documents_indexed: int
+
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+def get_memory_unit() -> MemoryUnit:
+    """Dependency to get initialized memory unit."""
+    if _memory_unit is None:
+        raise HTTPException(status_code=503, detail="Memory unit not initialized. Call /hydrate first.")
+    return _memory_unit
+
+
+# =============================================================================
+# Health & Status
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+def health_check():
+    """Health check endpoint."""
+    global _memory_unit
+    return HealthResponse(
+        status="healthy",
+        memory_unit_initialized=_memory_unit is not None,
+        documents_indexed=_memory_unit.vector_store.count() if _memory_unit and _memory_unit.vector_store else 0
+    )
+
+
+@app.get("/stats", response_model=StatsResponse)
+def get_stats(memory: MemoryUnit = Depends(get_memory_unit)):
+    """Get memory unit statistics."""
+    return StatsResponse(**memory.get_stats())
+
+
+# =============================================================================
+# Hydration
+# =============================================================================
+
+def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    """Extract token from Authorization: Bearer <token> header."""
+    if not authorization:
+        return None
+    if authorization.startswith("Bearer "):
+        return authorization[7:]
+    return authorization
+
+
+@app.post("/hydrate", response_model=HydrateResponse)
+def hydrate_memory(
+    request: HydrateRequest,
+    authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+    x_thread_id: Optional[str] = Header(None)
+):
+    """
+    Hydrate the memory unit from Google Drive.
+
+    Auth token is passed in Authorization: Bearer <token> header (from extension).
+    This fetches documents from the 2 subfolders and indexes them
+    in the vector store + keyword search database.
+    """
+    global _memory_unit
+
+    auth_token = extract_bearer_token(authorization)
+    if not auth_token:
+        raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
+
+    try:
+        logger.info(f"Initializing memory unit with folder: {request.root_folder_id}")
+
+        # Create or re-initialize memory unit
+        _memory_unit = MemoryUnit(
+            auth_token=auth_token,
+            persist_dir=request.persist_dir,
+            model_name=request.model_name
+        )
+
+        _memory_unit.folder_config = DriveFolderConfig(
+            root_folder_id=request.root_folder_id,
+            user_provided_folder_id="",
+            machine_generated_folder_id=""
+        )
+
+        # Hydrate from Drive
+        result = _memory_unit.hydrate_from_drive(request.root_folder_id)
+
+        logger.info(f"Hydrated {result['documents_indexed']} documents")
+
+        return HydrateResponse(**result)
+
+    except Exception as e:
+        logger.error(f"Hydration failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Query Endpoints
+# =============================================================================
+
+@app.post("/query", response_model=ContextResponse)
+def query_memory(request: QueryRequest, memory: MemoryUnit = Depends(get_memory_unit)):
+    """
+    Query the memory unit using agentic RAG.
+
+    Combines hybrid search over diverse user documents with targeted
+    retrieval from machine-generated preference/trend files.
+    """
+    try:
+        result = memory.query(request.query)
+        return ContextResponse(
+            answer=result.answer,
+            sources=result.sources,
+            context_for_extension=result.context_for_extension,
+            context_for_task_identifier=result.context_for_task_identifier,
+            context_for_workflow_builder=result.context_for_workflow_builder,
+            user_preferences=result.user_preferences,
+            task_patterns=result.task_patterns,
+            workflow_trends=result.workflow_trends
+        )
+    except Exception as e:
+        logger.error(f"Query failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/vector-search")
+def vector_search(
+    query: str,
+    n_results: int = 5,
+    memory: MemoryUnit = Depends(get_memory_unit)
+):
+    """Direct vector search (semantic similarity)."""
+    try:
+        results = memory.vector_store.query(query, n_results=n_results)
+        return {
+            "query": query,
+            "results": [
+                {
+                    "content": doc,
+                    "metadata": meta,
+                    "distance": dist
+                }
+                for doc, meta, dist in zip(
+                    results["documents"][0],
+                    results["metadatas"][0],
+                    results["distances"][0]
+                )
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/keyword-search")
+def keyword_search(
+    query: str,
+    top_k: int = 5,
+    memory: MemoryUnit = Depends(get_memory_unit)
+):
+    """Direct keyword search (BM25)."""
+    try:
+        results = memory.keyword_searcher.search(query, top_k=top_k)
+        return {
+            "query": query,
+            "results": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Context Injection Endpoints (for System Diagram integration)
+# =============================================================================
+
+@app.post("/context/extension")
+def get_extension_context(
+    request: ExtensionContextRequest,
+    memory: MemoryUnit = Depends(get_memory_unit)
+):
+    """
+    Get additional context for Extension component.
+
+    From system diagram:
+    [Memory Unit] --> [Additional ctxt for Task/Workflow] --> [Extension]
+    """
+    try:
+        context = memory.get_context_for_extension(request.query)
+        return {
+            "context": context,
+            "target": "extension"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/context/task-identifier")
+def get_task_identifier_context(
+    request: TaskIdentifierContextRequest,
+    memory: MemoryUnit = Depends(get_memory_unit)
+):
+    """
+    Get additional context for Task Identifier component.
+
+    From system diagram:
+    [Memory Unit] --> [Additional ctxt for Task/Workflow] --> [Task Identifier]
+    """
+    try:
+        context = memory.get_context_for_task_identifier(request.task_description)
+        return {
+            "context": context,
+            "target": "task_identifier"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/context/workflow-builder")
+def get_workflow_builder_context(
+    request: WorkflowBuilderContextRequest,
+    memory: MemoryUnit = Depends(get_memory_unit)
+):
+    """
+    Get additional context for Workflow Builder component.
+
+    From system diagram:
+    [Memory Unit] --> [Additional ctxt for Workflow] --> [Workflow Builder]
+    """
+    try:
+        context = memory.get_context_for_workflow_builder(request.task_description)
+        return {
+            "context": context,
+            "target": "workflow_builder"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/preferences", response_model=PreferencesResponse)
+def get_preferences(
+    category: Optional[str] = None,
+    memory: MemoryUnit = Depends(get_memory_unit)
+):
+    """
+    Get raw machine-generated preferences by category.
+
+    Categories:
+    - user_preferences: User's style, habits, likes/dislikes
+    - task_patterns: Common task types, frequencies, patterns
+    - workflow_trends: Successful workflows, optimization opportunities
+    """
+    try:
+        prefs = memory.get_direct_preferences(category)
+        return PreferencesResponse(
+            user_preferences=prefs.get("user_preferences", []),
+            task_patterns=prefs.get("task_patterns", []),
+            workflow_trends=prefs.get("workflow_trends", [])
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Management
+# =============================================================================
+
+@app.post("/clear")
+def clear_memory(memory: MemoryUnit = Depends(get_memory_unit)):
+    """Clear all indexed documents."""
+    try:
+        memory.clear()
+        return {"status": "cleared", "message": "All documents removed from memory"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/refresh")
+def refresh_memory(
+    authorization: Optional[str] = Header(None),
+    memory: MemoryUnit = Depends(get_memory_unit)
+):
+    """Refresh memory by re-hydrating from Drive."""
+    try:
+        auth_token = extract_bearer_token(authorization)
+
+        if not auth_token:
+            # Fall back to stored token if available
+            auth_token = memory.auth_token
+
+        if not auth_token:
+            raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
+
+        # Re-initialize Drive client with token
+        memory.drive_client.auth_token = auth_token
+
+        # Clear and re-hydrate
+        memory.clear()
+        result = memory.hydrate_from_drive()
+
+        return {
+            "status": "refreshed",
+            **result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "0.0.0.0")
+
+    uvicorn.run(app, host=host, port=port)

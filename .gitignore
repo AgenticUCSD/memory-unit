@@ -1,0 +1,8 @@
+.env
+.claude
+.deepeval
+.vscode
+
+chroma_data
+__pycache__
+.pytest_cache
