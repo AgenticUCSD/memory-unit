@@ -19,6 +19,11 @@ import logging
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# Load OPENAI_API_KEY / CONFIDENT_API_KEY / PORT / HOST from .env (memory-unit had no
+# config module that did this, so the .env file was previously inert).
+load_dotenv()
 
 from memory_unit import MemoryUnit, ContextQueryResult, DriveFolderConfig
 
@@ -180,9 +185,9 @@ def hydrate_memory(
     try:
         logger.info(f"Initializing memory unit with folder: {request.root_folder_id}")
 
-        # Create or re-initialize memory unit
+        # Create or re-initialize memory unit. The ephemeral auth token is NOT a
+        # constructor argument — it is supplied to hydrate_from_drive() at call time.
         _memory_unit = MemoryUnit(
-            auth_token=auth_token,
             persist_dir=request.persist_dir,
             model_name=request.model_name
         )
@@ -193,8 +198,8 @@ def hydrate_memory(
             machine_generated_folder_id=""
         )
 
-        # Hydrate from Drive
-        result = _memory_unit.hydrate_from_drive(request.root_folder_id)
+        # Hydrate from Drive (root folder id + ephemeral token).
+        result = _memory_unit.hydrate_from_drive(request.root_folder_id, auth_token)
 
         logger.info(f"Hydrated {result['documents_indexed']} documents")
 
@@ -400,17 +405,27 @@ def refresh_memory(
         if not auth_token:
             raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
 
-        # Re-initialize Drive client with token
-        memory.drive_client.auth_token = auth_token
+        # Resolve the root folder id captured at the last hydrate. Without it there
+        # is nothing to refresh — the caller must hydrate first.
+        root_folder_id = getattr(memory, "root_folder_id", None)
+        if not root_folder_id and memory.folder_config:
+            root_folder_id = memory.folder_config.root_folder_id
+        if not root_folder_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Nothing to refresh; call /hydrate first."
+            )
 
-        # Clear and re-hydrate
-        memory.clear()
-        result = memory.hydrate_from_drive()
+        # Re-hydrate (clears old data internally) with the root folder + token.
+        result = memory.hydrate_from_drive(root_folder_id, auth_token)
 
+        # Spread result first so its "status": "success" does not clobber "refreshed".
         return {
-            "status": "refreshed",
-            **result
+            **result,
+            "status": "refreshed"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
