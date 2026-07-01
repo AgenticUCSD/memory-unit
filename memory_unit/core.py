@@ -45,6 +45,7 @@ class MemoryUnit:
         model_name: str = "gpt-4o"
     ):
         self.auth_token: Optional[str] = None
+        self.root_folder_id: Optional[str] = None
         self.persist_dir = persist_dir
         self.model_name = model_name
 
@@ -92,15 +93,22 @@ class MemoryUnit:
         Returns:
             Dict with status, document counts, and folder structure info
         """
-        # Store the ephemeral token
+        # Store the ephemeral token and the root folder so /refresh can re-hydrate
+        # without the caller re-supplying the folder id.
         self.auth_token = auth_token
+        self.root_folder_id = root_folder_id
 
         # Create drive client with ephemeral token
         self.drive_client = GoogleDriveClient(auth_token)
 
-        # Re-initialize agent if needed (now that we may have context)
+        # Re-initialize agent if needed (now that we may have context). The agent is
+        # only required at query time, so a missing OpenAI key must not break hydration
+        # — mirror the tolerant behavior of __init__.
         if not self.query_agent:
-            self._initialize_agent()
+            try:
+                self._initialize_agent()
+            except Exception:
+                self.query_agent = None
 
         # Clear existing data before re-hydrating
         self.clear()
