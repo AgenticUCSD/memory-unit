@@ -38,10 +38,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS middleware
+# CORS middleware. Origins come from the ALLOWED_ORIGINS env var (comma-separated);
+# we no longer ship `allow_origins=["*"]` — that is both a tenancy hole and an invalid
+# combination with allow_credentials=True (browsers reject a credentialed wildcard).
+_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()] or [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:8080",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,6 +57,11 @@ app.add_middleware(
 
 # Global memory unit instance
 _memory_unit: Optional[MemoryUnit] = None
+
+# The user_id (Google `sub`) that hydrated the current memory. Until per-user data
+# isolation lands, the unit holds one user's documents at a time, so we refuse to serve
+# a *different* user from the hydrating user's data. Set on /hydrate.
+_owner_user_id: Optional[str] = None
 
 
 # =============================================================================
@@ -128,6 +141,20 @@ def get_memory_unit() -> MemoryUnit:
     return _memory_unit
 
 
+def require_owner(x_user_id: Optional[str] = Header(None)) -> str:
+    """Tenancy guard: every data endpoint must carry X-User-Id, and (once the unit has
+    been hydrated) that user must match the user who hydrated it. Prevents serving one
+    user's memory to another while the store is still single-tenant."""
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header required")
+    if _owner_user_id is not None and x_user_id != _owner_user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This memory unit was hydrated for a different user.",
+        )
+    return x_user_id
+
+
 # =============================================================================
 # Health & Status
 # =============================================================================
@@ -144,7 +171,7 @@ def health_check():
 
 
 @app.get("/stats", response_model=StatsResponse)
-def get_stats(memory: MemoryUnit = Depends(get_memory_unit)):
+def get_stats(memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends(require_owner)):
     """Get memory unit statistics."""
     return StatsResponse(**memory.get_stats())
 
@@ -176,11 +203,13 @@ def hydrate_memory(
     This fetches documents from the 2 subfolders and indexes them
     in the vector store + keyword search database.
     """
-    global _memory_unit
+    global _memory_unit, _owner_user_id
 
     auth_token = extract_bearer_token(authorization)
     if not auth_token:
         raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header required")
 
     try:
         logger.info(f"Initializing memory unit with folder: {request.root_folder_id}")
@@ -201,6 +230,10 @@ def hydrate_memory(
         # Hydrate from Drive (root folder id + ephemeral token).
         result = _memory_unit.hydrate_from_drive(request.root_folder_id, auth_token)
 
+        # Claim ownership only after a successful hydrate, so a failed hydrate doesn't
+        # lock the unit to a user with no data.
+        _owner_user_id = x_user_id
+
         logger.info(f"Hydrated {result['documents_indexed']} documents")
 
         return HydrateResponse(**result)
@@ -215,7 +248,7 @@ def hydrate_memory(
 # =============================================================================
 
 @app.post("/query", response_model=ContextResponse)
-def query_memory(request: QueryRequest, memory: MemoryUnit = Depends(get_memory_unit)):
+def query_memory(request: QueryRequest, memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends(require_owner)):
     """
     Query the memory unit using agentic RAG.
 
@@ -243,7 +276,8 @@ def query_memory(request: QueryRequest, memory: MemoryUnit = Depends(get_memory_
 def vector_search(
     query: str,
     n_results: int = 5,
-    memory: MemoryUnit = Depends(get_memory_unit)
+    memory: MemoryUnit = Depends(get_memory_unit),
+    _: str = Depends(require_owner)
 ):
     """Direct vector search (semantic similarity)."""
     try:
@@ -271,7 +305,8 @@ def vector_search(
 def keyword_search(
     query: str,
     top_k: int = 5,
-    memory: MemoryUnit = Depends(get_memory_unit)
+    memory: MemoryUnit = Depends(get_memory_unit),
+    _: str = Depends(require_owner)
 ):
     """Direct keyword search (BM25)."""
     try:
@@ -291,7 +326,8 @@ def keyword_search(
 @app.post("/context/extension")
 def get_extension_context(
     request: ExtensionContextRequest,
-    memory: MemoryUnit = Depends(get_memory_unit)
+    memory: MemoryUnit = Depends(get_memory_unit),
+    _: str = Depends(require_owner)
 ):
     """
     Get additional context for Extension component.
@@ -312,7 +348,8 @@ def get_extension_context(
 @app.post("/context/task-identifier")
 def get_task_identifier_context(
     request: TaskIdentifierContextRequest,
-    memory: MemoryUnit = Depends(get_memory_unit)
+    memory: MemoryUnit = Depends(get_memory_unit),
+    _: str = Depends(require_owner)
 ):
     """
     Get additional context for Task Identifier component.
@@ -333,7 +370,8 @@ def get_task_identifier_context(
 @app.post("/context/workflow-builder")
 def get_workflow_builder_context(
     request: WorkflowBuilderContextRequest,
-    memory: MemoryUnit = Depends(get_memory_unit)
+    memory: MemoryUnit = Depends(get_memory_unit),
+    _: str = Depends(require_owner)
 ):
     """
     Get additional context for Workflow Builder component.
@@ -354,7 +392,8 @@ def get_workflow_builder_context(
 @app.get("/preferences", response_model=PreferencesResponse)
 def get_preferences(
     category: Optional[str] = None,
-    memory: MemoryUnit = Depends(get_memory_unit)
+    memory: MemoryUnit = Depends(get_memory_unit),
+    _: str = Depends(require_owner)
 ):
     """
     Get raw machine-generated preferences by category.
@@ -380,7 +419,7 @@ def get_preferences(
 # =============================================================================
 
 @app.post("/clear")
-def clear_memory(memory: MemoryUnit = Depends(get_memory_unit)):
+def clear_memory(memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends(require_owner)):
     """Clear all indexed documents."""
     try:
         memory.clear()
@@ -392,7 +431,8 @@ def clear_memory(memory: MemoryUnit = Depends(get_memory_unit)):
 @app.post("/refresh")
 def refresh_memory(
     authorization: Optional[str] = Header(None),
-    memory: MemoryUnit = Depends(get_memory_unit)
+    memory: MemoryUnit = Depends(get_memory_unit),
+    _: str = Depends(require_owner)
 ):
     """Refresh memory by re-hydrating from Drive."""
     try:

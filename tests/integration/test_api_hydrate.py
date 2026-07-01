@@ -56,10 +56,12 @@ class FakeMemoryUnit:
 
 @pytest.fixture(autouse=True)
 def reset_global():
-    """Each test starts with no hydrated memory unit."""
+    """Each test starts with no hydrated memory unit and no owner."""
     api_module._memory_unit = None
+    api_module._owner_user_id = None
     yield
     api_module._memory_unit = None
+    api_module._owner_user_id = None
 
 
 @pytest.fixture
@@ -77,7 +79,7 @@ def test_hydrate_succeeds_and_wires_args_correctly(client):
         resp = client.post(
             "/hydrate",
             json={"root_folder_id": "root123"},
-            headers={"Authorization": "Bearer ya29.fake"},
+            headers={"Authorization": "Bearer ya29.fake", "X-User-Id": "user-1"},
         )
 
     assert resp.status_code == 200, resp.text
@@ -103,10 +105,11 @@ def test_refresh_reuses_stored_root_folder(client):
         client.post(
             "/hydrate",
             json={"root_folder_id": "root123"},
-            headers={"Authorization": "Bearer ya29.first"},
+            headers={"Authorization": "Bearer ya29.first", "X-User-Id": "user-1"},
         )
         resp = client.post(
-            "/refresh", headers={"Authorization": "Bearer ya29.second"}
+            "/refresh",
+            headers={"Authorization": "Bearer ya29.second", "X-User-Id": "user-1"},
         )
 
     assert resp.status_code == 200, resp.text
