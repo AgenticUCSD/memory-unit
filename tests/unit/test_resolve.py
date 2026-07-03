@@ -44,6 +44,15 @@ def test_resolve_extracts_duration_number(tmp_path):
     assert slot["value"] == "30 minutes"
 
 
+def test_extract_value_prefers_number_with_unit():
+    # Regression: the "1" in "1:1s" must not beat the real "30 minutes".
+    mu = MemoryUnit.__new__(MemoryUnit)
+    got = mu._extract_value(
+        "meeting_duration", "Preferred meeting duration for 1:1s is 30 minutes."
+    )
+    assert got == "30 minutes"
+
+
 def test_extract_value_falls_back_to_clause():
     # No email/number type match -> clause after the connector, trimmed.
     mu = MemoryUnit.__new__(MemoryUnit)  # no __init__ needed for the pure helper
