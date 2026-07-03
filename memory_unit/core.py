@@ -2,7 +2,16 @@
 Core MemoryUnit implementation.
 """
 
+import re
 from typing import List, Dict, Any, Optional
+
+# Deterministic value extraction for common slot kinds.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_NUMBER_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:minutes?|mins?|hours?|hrs?|days?|weeks?|months?|%|percent|dollars?|usd)?\b",
+    re.IGNORECASE,
+)
+_CONNECTOR_RE = re.compile(r"(?:\bis\b|\bare\b|:|=)\s*(.+)", re.IGNORECASE)
 
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
@@ -354,6 +363,7 @@ class MemoryUnit:
             item: Dict[str, Any] = {
                 "field": field,
                 "value": None,
+                "evidence": None,
                 "source": None,
                 "confidence": 0.0,
                 "status": "missing",
@@ -377,11 +387,18 @@ class MemoryUnit:
         Keyword/BM25 first (deterministic, no embeddings); vector search is a
         best-effort fallback when the keyword index yields nothing.
         """
-        hits = self.keyword_searcher.search(field, top_k=1)
+        # Slot names are typically snake_case; the BM25 tokenizer drops "_"-joined
+        # words, so search on a space-normalized query (e.g. "meeting_duration" ->
+        # "meeting duration"). The original `field` still drives value extraction.
+        query = field.replace("_", " ").strip() or field
+
+        hits = self.keyword_searcher.search(query, top_k=1)
         if hits and float(hits[0].get("score", 0.0)) > min_score:
             score = float(hits[0]["score"])
+            snippet = hits[0]["content"].strip()
             return {
-                "value": hits[0]["content"].strip()[:500],
+                "value": self._extract_value(field, snippet),
+                "evidence": snippet[:500],
                 "source": "context",
                 # Map an unbounded BM25 score monotonically into (0, 1).
                 "confidence": round(score / (score + 1.0), 3),
@@ -389,14 +406,16 @@ class MemoryUnit:
 
         # Vector fallback — embeddings may be unavailable offline, so guard it.
         try:
-            results = self.vector_store.query(field, n_results=1)
+            results = self.vector_store.query(query, n_results=1)
             docs = results.get("documents") or [[]]
             dists = results.get("distances") or [[]]
             if docs and docs[0]:
                 distance = float(dists[0][0]) if dists and dists[0] else 1.0
+                snippet = docs[0][0].strip()
                 # Chroma distances are >= 0 (smaller = closer). Convert to (0, 1].
                 return {
-                    "value": docs[0][0].strip()[:500],
+                    "value": self._extract_value(field, snippet),
+                    "evidence": snippet[:500],
                     "source": "context",
                     "confidence": round(1.0 / (1.0 + distance), 3),
                 }
@@ -404,6 +423,48 @@ class MemoryUnit:
             pass
 
         return None
+
+    def _extract_value(self, field: str, text: str) -> str:
+        """Best-effort concise value for ``field`` from an evidence snippet.
+
+        Deterministic and conservative: type-aware regexes for common slot kinds
+        (email, number/duration), else the clause following the field mention,
+        else a trimmed first sentence. Always returns a non-empty string (falls
+        back to the snippet) so a resolved slot never has an empty value. The full
+        snippet is preserved separately as ``evidence`` for transparency.
+        """
+        text = " ".join(text.split())  # normalize whitespace
+        if not text:
+            return text
+        field_l = field.lower()
+
+        if any(k in field_l for k in ("email", "recipient", "sender", "contact", "address")):
+            m = _EMAIL_RE.search(text)
+            if m:
+                return m.group(0)
+
+        if any(
+            k in field_l
+            for k in ("duration", "length", "minutes", "time", "number", "count", "amount", "size", "budget")
+        ):
+            m = _NUMBER_RE.search(text)
+            if m and m.group(0).strip():
+                return m.group(0).strip()
+
+        # "<field> ... is/:/= <value>" — the clause after a connector following
+        # the field mention.
+        head = field_l.split("_")[0]
+        idx = text.lower().find(head) if head else -1
+        if idx != -1:
+            m = _CONNECTOR_RE.search(text[idx:])
+            if m:
+                clause = re.split(r"[.;\n]", m.group(1))[0].strip()
+                if clause:
+                    return clause[:200]
+
+        # Fallback: first sentence / trimmed snippet.
+        first = re.split(r"[.;\n]", text)[0].strip()
+        return (first or text)[:200]
 
     def _build_task_identifier_context(
         self,

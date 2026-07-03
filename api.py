@@ -109,6 +109,7 @@ class ResolveRequest(BaseModel):
 class ResolvedSlot(BaseModel):
     field: str
     value: Optional[str] = None
+    evidence: Optional[str] = None  # the snippet `value` was extracted from
     source: Optional[str] = None
     confidence: float = 0.0
     status: str = "missing"
