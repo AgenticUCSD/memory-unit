@@ -2,6 +2,9 @@
 Core MemoryUnit implementation.
 """
 
+import hashlib
+import json
+import os
 import re
 from typing import List, Dict, Any, Optional
 
@@ -57,6 +60,10 @@ class MemoryUnit:
         self.root_folder_id: Optional[str] = None
         self.persist_dir = persist_dir
         self.model_name = model_name
+        # Durable store for write-back ("learned") context, re-applied on hydrate.
+        self._learned_path = (
+            os.path.join(persist_dir, "learned_context.jsonl") if persist_dir else None
+        )
 
         # Initialize persistent components that don't need auth
         self.vector_store = VectorStore(persist_dir=persist_dir)
@@ -217,6 +224,13 @@ class MemoryUnit:
             self.keyword_searcher.index_documents(texts, metadatas)
 
         self.is_hydrated = True
+
+        # Re-apply previously learned (write-back) context so it survives the
+        # clear()+rebuild that hydrate does. Best-effort: must not break hydrate.
+        try:
+            self._reload_learned()
+        except Exception as e:
+            print(f"Failed to reload learned context: {e}")
 
         return {
             "status": "success",
@@ -465,6 +479,121 @@ class MemoryUnit:
         # Fallback: first sentence / trimmed snippet.
         first = re.split(r"[.;\n]", text)[0].strip()
         return (first or text)[:200]
+
+    def learn(self, items: List[Dict[str, Any]]) -> int:
+        """Write-back: ingest distilled 'learned' context so future resolve()/query()
+        calls benefit (self-learning).
+
+        Each item is ``{text, category?, task_id?}``. Blocks are added to the
+        unified index (vector + keyword) and appended to a durable JSONL in
+        ``persist_dir`` so they survive the clear()+rebuild of a re-hydrate.
+        Duplicate text (same content hash) is skipped. Returns the number of new
+        blocks learned.
+
+        Note: true cross-restart durability on ephemeral hosts still depends on
+        the Phase-1 shared store (or the extension writing back to Drive); this
+        persists to the same ``persist_dir`` as the rest of the index.
+        """
+        seen = self._learned_hashes()
+        records = []
+        for item in items:
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+            h = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if h in seen:
+                continue
+            seen.add(h)
+            records.append(
+                {"hash": h, "text": text, "category": item.get("category"), "task_id": item.get("task_id")}
+            )
+
+        if not records:
+            return 0
+
+        docs = [self._learned_doc(r) for r in records]
+        self._index_documents(docs)
+        self.documents.extend(docs)
+        self._persist_learned(records)
+        return len(records)
+
+    def _learned_doc(self, record: Dict[str, Any]) -> ContextDocument:
+        name = record.get("task_id") or record["hash"][:8]
+        return ContextDocument(
+            content=record["text"],
+            source="write-back",
+            filename=f"learned/{name}.txt",
+            doc_type=".txt",
+            folder="machine_generated",
+            chunk_index=0,
+        )
+
+    def _index_documents(self, docs: List[ContextDocument]) -> None:
+        """Add docs to the vector store (best-effort) and rebuild the keyword index."""
+        if not docs:
+            return
+        # Vector add can fail without a usable embeddings backend; the keyword
+        # (BM25) path is the deterministic one resolve() uses first, so guard it.
+        try:
+            self.vector_store.add_documents(docs)
+        except Exception as e:
+            print(f"Vector add failed for learned docs: {e}")
+
+        texts = list(self.keyword_searcher.documents) + [d.content for d in docs]
+        metas = list(self.keyword_searcher.metadatas) + [
+            {
+                "source": d.source,
+                "filename": d.filename,
+                "folder": d.folder,
+                "is_preference": d.folder == "machine_generated",
+            }
+            for d in docs
+        ]
+        self.keyword_searcher.index_documents(texts, metas)
+
+    def _learned_hashes(self) -> set:
+        if not self._learned_path or not os.path.exists(self._learned_path):
+            return set()
+        hashes = set()
+        try:
+            with open(self._learned_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    if rec.get("hash"):
+                        hashes.add(rec["hash"])
+        except Exception:
+            return hashes
+        return hashes
+
+    def _persist_learned(self, records: List[Dict[str, Any]]) -> None:
+        if not self._learned_path:
+            return
+        try:
+            with open(self._learned_path, "a", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec) + "\n")
+        except Exception as e:
+            print(f"Failed to persist learned context: {e}")
+
+    def _reload_learned(self) -> None:
+        """Re-ingest persisted learned blocks into the (freshly rebuilt) index."""
+        if not self._learned_path or not os.path.exists(self._learned_path):
+            return
+        docs = []
+        with open(self._learned_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if (rec.get("text") or "").strip():
+                    docs.append(self._learned_doc(rec))
+        if docs:
+            self._index_documents(docs)
+            self.documents.extend(docs)
 
     def _build_task_identifier_context(
         self,

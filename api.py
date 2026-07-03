@@ -119,6 +119,22 @@ class ResolveResponse(BaseModel):
     slots: List[ResolvedSlot]
 
 
+class LearnItem(BaseModel):
+    text: str = Field(..., description="Distilled fact to remember (write-back)")
+    category: Optional[str] = Field(
+        None, description="user_preferences|task_patterns|workflow_trends"
+    )
+    task_id: Optional[str] = Field(None, description="Originating task, for provenance")
+
+
+class LearnRequest(BaseModel):
+    items: List[LearnItem]
+
+
+class LearnResponse(BaseModel):
+    learned: int
+
+
 class ExtensionContextRequest(BaseModel):
     query: str
 
@@ -320,6 +336,23 @@ def resolve_slots(
         return ResolveResponse(slots=[ResolvedSlot(**r) for r in results])
     except Exception as e:
         logger.error(f"Resolve failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/learn", response_model=LearnResponse)
+def learn_context(
+    request: LearnRequest,
+    x_user_id: str = Depends(require_owner),
+    memory: MemoryUnit = Depends(get_memory_unit),
+):
+    """Write-back: ingest distilled context learned from completed tasks so future
+    resolve()/query() calls benefit. In-repo self-learning; durable Drive
+    persistence is a follow-up (extension-owned)."""
+    try:
+        count = memory.learn([item.model_dump() for item in request.items])
+        return LearnResponse(learned=count)
+    except Exception as e:
+        logger.error(f"Learn failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
