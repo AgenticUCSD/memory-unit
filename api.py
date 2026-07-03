@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from memory_unit import MemoryUnit, ContextQueryResult, DriveFolderConfig
+from memory_unit.auth import verify_google_token
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -228,6 +229,11 @@ def hydrate_memory(
         raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
     if not x_user_id:
         raise HTTPException(status_code=400, detail="X-User-Id header required")
+
+    # Verify the Google token (and that its `sub` matches X-User-Id) before we
+    # trust it to read Drive and bind this unit's owner. 401 on a bad token,
+    # 503 if Google is unreachable.
+    verify_google_token(auth_token, x_user_id)
 
     try:
         logger.info(f"Initializing memory unit with folder: {request.root_folder_id}")
@@ -476,14 +482,18 @@ def clear_memory(memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends
 def refresh_memory(
     authorization: Optional[str] = Header(None),
     memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner)
+    x_user_id: str = Depends(require_owner)
 ):
     """Refresh memory by re-hydrating from Drive."""
     try:
-        auth_token = extract_bearer_token(authorization)
+        supplied_token = extract_bearer_token(authorization)
 
-        if not auth_token:
-            # Fall back to stored token if available
+        if supplied_token:
+            # A freshly-supplied token must be verified (and belong to the owner).
+            verify_google_token(supplied_token, x_user_id)
+            auth_token = supplied_token
+        else:
+            # Fall back to the token already verified at hydrate time.
             auth_token = memory.auth_token
 
         if not auth_token:

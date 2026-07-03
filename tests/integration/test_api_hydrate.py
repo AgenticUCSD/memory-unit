@@ -64,6 +64,14 @@ def reset_global():
     api_module._owner_user_id = None
 
 
+@pytest.fixture(autouse=True)
+def disable_token_validation(monkeypatch):
+    """These tests exercise hydrate/refresh *wiring* with fake tokens, not token
+    validity — so turn off the Google tokeninfo check (covered separately in
+    test_api_token_validation.py)."""
+    monkeypatch.setenv("MEMORY_VALIDATE_TOKEN", "false")
+
+
 @pytest.fixture
 def client():
     return TestClient(app)
