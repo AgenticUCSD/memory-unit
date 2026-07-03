@@ -461,9 +461,9 @@ class MemoryUnit:
             k in field_l
             for k in ("duration", "length", "minutes", "time", "number", "count", "amount", "size", "budget")
         ):
-            m = _NUMBER_RE.search(text)
-            if m and m.group(0).strip():
-                return m.group(0).strip()
+            num = self._pick_number(text)
+            if num:
+                return num
 
         # "<field> ... is/:/= <value>" — the clause after a connector following
         # the field mention.
@@ -479,6 +479,24 @@ class MemoryUnit:
         # Fallback: first sentence / trimmed snippet.
         first = re.split(r"[.;\n]", text)[0].strip()
         return (first or text)[:200]
+
+    def _pick_number(self, text: str) -> Optional[str]:
+        """Pick the most meaningful number in ``text``.
+
+        Prefers a number carrying a unit ("30 minutes", "20%") over a bare number,
+        so incidental figures like the "1" in "1:1s" don't win over the real
+        value. Falls back to the first bare number if none carry a unit.
+        """
+        fallback = None
+        for m in _NUMBER_RE.finditer(text):
+            tok = m.group(0).strip()
+            if not tok:
+                continue
+            if re.search(r"[A-Za-z%]", tok):  # unit-bearing -> take immediately
+                return tok
+            if fallback is None:
+                fallback = tok
+        return fallback
 
     def learn(self, items: List[Dict[str, Any]]) -> int:
         """Write-back: ingest distilled 'learned' context so future resolve()/query()
