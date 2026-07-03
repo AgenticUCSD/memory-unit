@@ -319,6 +319,92 @@ class MemoryUnit:
             workflow_trends=[p.raw_content[:500] for p in workflow_trends]
         )
 
+    def resolve(
+        self,
+        fields: List[str],
+        user_id: Optional[str] = None,
+        scope: Optional[str] = None,
+        min_score: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """Resolve task parameter *slots* to concrete values from indexed context.
+
+        Unlike ``query()`` (which returns prose for injection), this returns a
+        structured ``field -> value`` list so the planner can pre-fill task
+        parameters from the user's own context before falling back to a human
+        (HITL). Each result carries ``source`` and a bounded ``confidence`` so the
+        caller can decide whether to trust the value or still ask.
+
+        Deliberately deterministic — keyword/BM25 over the unified index, no LLM —
+        so it is cheap and testable offline. LLM-based value *extraction* from the
+        matched evidence is a follow-up; today ``value`` is the best matching
+        context snippet.
+
+        Args:
+            fields: slot names to resolve (e.g. ["recipient", "meeting_duration"]).
+            user_id: reserved for per-user isolation (single-tenant today).
+            scope: reserved for hierarchical scope (global|org|role|user|thread).
+            min_score: minimum BM25 score before a field counts as resolved.
+
+        Returns:
+            One dict per input field: ``{field, value, source, confidence, status}``.
+            Unresolved fields come back with ``value=None`` and ``status="missing"``.
+        """
+        resolved: List[Dict[str, Any]] = []
+        for field in fields:
+            item: Dict[str, Any] = {
+                "field": field,
+                "value": None,
+                "source": None,
+                "confidence": 0.0,
+                "status": "missing",
+            }
+
+            if self.is_hydrated and field and field.strip():
+                best = self._best_evidence_for(field, min_score=min_score)
+                if best is not None:
+                    item.update(best)
+                    item["status"] = "present"
+
+            resolved.append(item)
+
+        return resolved
+
+    def _best_evidence_for(
+        self, field: str, min_score: float = 0.0
+    ) -> Optional[Dict[str, Any]]:
+        """Best supporting snippet for a slot name, or None.
+
+        Keyword/BM25 first (deterministic, no embeddings); vector search is a
+        best-effort fallback when the keyword index yields nothing.
+        """
+        hits = self.keyword_searcher.search(field, top_k=1)
+        if hits and float(hits[0].get("score", 0.0)) > min_score:
+            score = float(hits[0]["score"])
+            return {
+                "value": hits[0]["content"].strip()[:500],
+                "source": "context",
+                # Map an unbounded BM25 score monotonically into (0, 1).
+                "confidence": round(score / (score + 1.0), 3),
+            }
+
+        # Vector fallback — embeddings may be unavailable offline, so guard it.
+        try:
+            results = self.vector_store.query(field, n_results=1)
+            docs = results.get("documents") or [[]]
+            dists = results.get("distances") or [[]]
+            if docs and docs[0]:
+                distance = float(dists[0][0]) if dists and dists[0] else 1.0
+                # Chroma distances are >= 0 (smaller = closer). Convert to (0, 1].
+                return {
+                    "value": docs[0][0].strip()[:500],
+                    "source": "context",
+                    "confidence": round(1.0 / (1.0 + distance), 3),
+                }
+        except Exception:
+            pass
+
+        return None
+
     def _build_task_identifier_context(
         self,
         base_context: str,

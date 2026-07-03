@@ -99,6 +99,24 @@ class ContextResponse(BaseModel):
     workflow_trends: List[str] = []
 
 
+class ResolveRequest(BaseModel):
+    fields: List[str] = Field(..., description="Slot/parameter names to resolve to values")
+    scope: Optional[str] = Field(None, description="Reserved: global|org|role|user|thread")
+    min_score: float = Field(0.0, description="Minimum BM25 score before a field counts as resolved")
+
+
+class ResolvedSlot(BaseModel):
+    field: str
+    value: Optional[str] = None
+    source: Optional[str] = None
+    confidence: float = 0.0
+    status: str = "missing"
+
+
+class ResolveResponse(BaseModel):
+    slots: List[ResolvedSlot]
+
+
 class ExtensionContextRequest(BaseModel):
     query: str
 
@@ -269,6 +287,32 @@ def query_memory(request: QueryRequest, memory: MemoryUnit = Depends(get_memory_
         )
     except Exception as e:
         logger.error(f"Query failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/resolve", response_model=ResolveResponse)
+def resolve_slots(
+    request: ResolveRequest,
+    x_user_id: str = Depends(require_owner),
+    memory: MemoryUnit = Depends(get_memory_unit),
+):
+    """Resolve task parameter slots to concrete values (structured field->value).
+
+    This is the parameter-resolution surface the planner calls to pre-fill task
+    slots from user context before falling back to HITL. Unlike /query it returns
+    typed slots with source + confidence, not prose. Unresolved fields come back
+    with status="missing" so the caller knows to ask the human.
+    """
+    try:
+        results = memory.resolve(
+            request.fields,
+            user_id=x_user_id,
+            scope=request.scope,
+            min_score=request.min_score,
+        )
+        return ResolveResponse(slots=[ResolvedSlot(**r) for r in results])
+    except Exception as e:
+        logger.error(f"Resolve failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
