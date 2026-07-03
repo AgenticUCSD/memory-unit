@@ -295,6 +295,8 @@ def hydrate_memory(
 
         return HydrateResponse(**result)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Hydration failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -358,22 +360,35 @@ def resolve_slots(
 @app.post("/learn", response_model=LearnResponse)
 def learn_context(
     request: LearnRequest,
+    authorization: Optional[str] = Header(None),
     x_user_id: str = Depends(require_owner),
 ):
     """Write-back: ingest distilled context learned from completed tasks so future
     resolve()/query() calls benefit. In-repo self-learning; durable Drive
     persistence is a follow-up (extension-owned).
 
-    Unlike the read endpoints, /learn lazily initializes the unit and (if not yet
-    hydrated) claims ownership for the first writer — so a unit can be seeded via
-    write-back without a Drive hydrate."""
+    /learn lazily initializes the unit and (if not yet hydrated) claims ownership
+    for the first writer — so a unit can be seeded via write-back without a Drive
+    hydrate. Because it writes and can claim ownership, it authenticates the Google
+    token just like /hydrate (verification is a no-op when MEMORY_VALIDATE_TOKEN is
+    off, but a bearer token is still required)."""
     global _owner_user_id
+
+    # Authenticate before creating the unit or binding ownership (401/503 here
+    # must not be swallowed by the 500 handler below).
+    auth_token = extract_bearer_token(authorization)
+    if not auth_token:
+        raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
+    verify_google_token(auth_token, x_user_id)
+
     try:
         memory = _ensure_memory_unit()
         if _owner_user_id is None:
             _owner_user_id = x_user_id
         count = memory.learn([item.model_dump() for item in request.items])
         return LearnResponse(learned=count)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Learn failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

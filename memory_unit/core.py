@@ -506,11 +506,16 @@ class MemoryUnit:
                 return num
 
         # "<field> ... is/:/= <value>" — the clause after a connector following
-        # the field mention.
+        # the field mention. Match the head as a whole word so e.g. "time" does
+        # not match inside "sometimes".
         head = field_l.split("_")[0]
-        idx = text.lower().find(head) if head else -1
-        if idx != -1:
-            m = _CONNECTOR_RE.search(text[idx:])
+        # Match (and slice) the same string — case-insensitive — so the index
+        # stays aligned even for non-length-preserving lowercasing (e.g. "İ").
+        head_match = (
+            re.search(r"\b" + re.escape(head) + r"\b", text, re.IGNORECASE) if head else None
+        )
+        if head_match:
+            m = _CONNECTOR_RE.search(text[head_match.start():])
             if m:
                 clause = re.split(r"[.;\n]", m.group(1))[0].strip()
                 if clause:
@@ -635,10 +640,13 @@ class MemoryUnit:
                     line = line.strip()
                     if not line:
                         continue
-                    rec = json.loads(line)
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue  # skip a corrupt/partial line, keep the rest
                     if rec.get("hash"):
                         hashes.add(rec["hash"])
-        except Exception:
+        except OSError:
             return hashes
         return hashes
 
@@ -662,7 +670,10 @@ class MemoryUnit:
                 line = line.strip()
                 if not line:
                     continue
-                rec = json.loads(line)
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue  # skip a corrupt line, don't drop the rest
                 if (rec.get("text") or "").strip():
                     docs.append(self._learned_doc(rec))
                     scopes.append(rec.get("scope"))
