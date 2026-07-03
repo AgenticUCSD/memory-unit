@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from memory_unit import MemoryUnit, ContextQueryResult, DriveFolderConfig
+from memory_unit.auth import verify_google_token
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -97,6 +98,41 @@ class ContextResponse(BaseModel):
     user_preferences: List[str] = []
     task_patterns: List[str] = []
     workflow_trends: List[str] = []
+
+
+class ResolveRequest(BaseModel):
+    fields: List[str] = Field(..., description="Slot/parameter names to resolve to values")
+    scope: Optional[str] = Field(None, description="Reserved: global|org|role|user|thread")
+    min_score: float = Field(0.0, description="Minimum BM25 score before a field counts as resolved")
+
+
+class ResolvedSlot(BaseModel):
+    field: str
+    value: Optional[str] = None
+    evidence: Optional[str] = None  # the snippet `value` was extracted from
+    source: Optional[str] = None
+    confidence: float = 0.0
+    status: str = "missing"
+
+
+class ResolveResponse(BaseModel):
+    slots: List[ResolvedSlot]
+
+
+class LearnItem(BaseModel):
+    text: str = Field(..., description="Distilled fact to remember (write-back)")
+    category: Optional[str] = Field(
+        None, description="user_preferences|task_patterns|workflow_trends"
+    )
+    task_id: Optional[str] = Field(None, description="Originating task, for provenance")
+
+
+class LearnRequest(BaseModel):
+    items: List[LearnItem]
+
+
+class LearnResponse(BaseModel):
+    learned: int
 
 
 class ExtensionContextRequest(BaseModel):
@@ -211,6 +247,11 @@ def hydrate_memory(
     if not x_user_id:
         raise HTTPException(status_code=400, detail="X-User-Id header required")
 
+    # Verify the Google token (and that its `sub` matches X-User-Id) before we
+    # trust it to read Drive and bind this unit's owner. 401 on a bad token,
+    # 503 if Google is unreachable.
+    verify_google_token(auth_token, x_user_id)
+
     try:
         logger.info(f"Initializing memory unit with folder: {request.root_folder_id}")
 
@@ -269,6 +310,49 @@ def query_memory(request: QueryRequest, memory: MemoryUnit = Depends(get_memory_
         )
     except Exception as e:
         logger.error(f"Query failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/resolve", response_model=ResolveResponse)
+def resolve_slots(
+    request: ResolveRequest,
+    x_user_id: str = Depends(require_owner),
+    memory: MemoryUnit = Depends(get_memory_unit),
+):
+    """Resolve task parameter slots to concrete values (structured field->value).
+
+    This is the parameter-resolution surface the planner calls to pre-fill task
+    slots from user context before falling back to HITL. Unlike /query it returns
+    typed slots with source + confidence, not prose. Unresolved fields come back
+    with status="missing" so the caller knows to ask the human.
+    """
+    try:
+        results = memory.resolve(
+            request.fields,
+            user_id=x_user_id,
+            scope=request.scope,
+            min_score=request.min_score,
+        )
+        return ResolveResponse(slots=[ResolvedSlot(**r) for r in results])
+    except Exception as e:
+        logger.error(f"Resolve failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/learn", response_model=LearnResponse)
+def learn_context(
+    request: LearnRequest,
+    x_user_id: str = Depends(require_owner),
+    memory: MemoryUnit = Depends(get_memory_unit),
+):
+    """Write-back: ingest distilled context learned from completed tasks so future
+    resolve()/query() calls benefit. In-repo self-learning; durable Drive
+    persistence is a follow-up (extension-owned)."""
+    try:
+        count = memory.learn([item.model_dump() for item in request.items])
+        return LearnResponse(learned=count)
+    except Exception as e:
+        logger.error(f"Learn failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -432,14 +516,18 @@ def clear_memory(memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends
 def refresh_memory(
     authorization: Optional[str] = Header(None),
     memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner)
+    x_user_id: str = Depends(require_owner)
 ):
     """Refresh memory by re-hydrating from Drive."""
     try:
-        auth_token = extract_bearer_token(authorization)
+        supplied_token = extract_bearer_token(authorization)
 
-        if not auth_token:
-            # Fall back to stored token if available
+        if supplied_token:
+            # A freshly-supplied token must be verified (and belong to the owner).
+            verify_google_token(supplied_token, x_user_id)
+            auth_token = supplied_token
+        else:
+            # Fall back to the token already verified at hydrate time.
             auth_token = memory.auth_token
 
         if not auth_token:
