@@ -82,3 +82,26 @@ def test_resolve_preserves_field_order(tmp_path):
     fields = ["duration", "recipient", "unknown_zzz"]
     out = mu.resolve(fields)
     assert [s["field"] for s in out] == fields
+
+
+def test_resolve_serves_after_learn_without_hydrate(tmp_path):
+    # Hydrate-gap fix: a unit seeded via learn() is queryable without a Drive hydrate.
+    mu = MemoryUnit(persist_dir=str(tmp_path))
+    assert mu.is_hydrated is False
+    mu.learn([{"text": "Default recipient is eve@example.com."}])
+    slot = mu.resolve(["recipient"])[0]
+    assert slot["status"] == "present"
+    assert slot["value"] == "eve@example.com"
+
+
+def test_resolve_prefers_more_specific_scope(tmp_path):
+    mu = MemoryUnit(persist_dir=str(tmp_path))
+    mu.learn([
+        {"text": "The billing project code is PROJ-GLOBAL-1.", "scope": "global"},
+        {"text": "The billing project code is PROJ-USER-9.", "scope": "user"},
+    ])
+    # "user" is more specific than "global" -> the user-scoped value wins.
+    slot = mu.resolve(["project_code"], scope=["user", "global"])[0]
+    assert slot["status"] == "present"
+    assert "PROJ-USER-9" in slot["value"]
+    assert slot["scope"] == "user"

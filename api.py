@@ -102,7 +102,9 @@ class ContextResponse(BaseModel):
 
 class ResolveRequest(BaseModel):
     fields: List[str] = Field(..., description="Slot/parameter names to resolve to values")
-    scope: Optional[str] = Field(None, description="Reserved: global|org|role|user|thread")
+    scope: Optional[List[str]] = Field(
+        None, description="Ordered preferred scopes, most-specific first (e.g. [user, org, global])"
+    )
     min_score: float = Field(0.0, description="Minimum BM25 score before a field counts as resolved")
 
 
@@ -112,6 +114,7 @@ class ResolvedSlot(BaseModel):
     evidence: Optional[str] = None  # the snippet `value` was extracted from
     source: Optional[str] = None
     confidence: float = 0.0
+    scope: Optional[str] = None  # scope label of the winning evidence, if any
     status: str = "missing"
 
 
@@ -125,6 +128,9 @@ class LearnItem(BaseModel):
         None, description="user_preferences|task_patterns|workflow_trends"
     )
     task_id: Optional[str] = Field(None, description="Originating task, for provenance")
+    scope: Optional[str] = Field(
+        None, description="Scope label for hierarchical resolution, e.g. user|org|global"
+    )
 
 
 class LearnRequest(BaseModel):
@@ -174,6 +180,16 @@ def get_memory_unit() -> MemoryUnit:
     """Dependency to get initialized memory unit."""
     if _memory_unit is None:
         raise HTTPException(status_code=503, detail="Memory unit not initialized. Call /hydrate first.")
+    return _memory_unit
+
+
+def _ensure_memory_unit() -> MemoryUnit:
+    """Return the global memory unit, lazily creating an empty one if needed.
+
+    Lets write-back (/learn) seed a queryable unit without a Drive hydrate."""
+    global _memory_unit
+    if _memory_unit is None:
+        _memory_unit = MemoryUnit()
     return _memory_unit
 
 
@@ -343,12 +359,19 @@ def resolve_slots(
 def learn_context(
     request: LearnRequest,
     x_user_id: str = Depends(require_owner),
-    memory: MemoryUnit = Depends(get_memory_unit),
 ):
     """Write-back: ingest distilled context learned from completed tasks so future
     resolve()/query() calls benefit. In-repo self-learning; durable Drive
-    persistence is a follow-up (extension-owned)."""
+    persistence is a follow-up (extension-owned).
+
+    Unlike the read endpoints, /learn lazily initializes the unit and (if not yet
+    hydrated) claims ownership for the first writer — so a unit can be seeded via
+    write-back without a Drive hydrate."""
+    global _owner_user_id
     try:
+        memory = _ensure_memory_unit()
+        if _owner_user_id is None:
+            _owner_user_id = x_user_id
         count = memory.learn([item.model_dump() for item in request.items])
         return LearnResponse(learned=count)
     except Exception as e:
