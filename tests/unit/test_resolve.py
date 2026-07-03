@@ -53,6 +53,13 @@ def test_extract_value_prefers_number_with_unit():
     assert got == "30 minutes"
 
 
+def test_extract_value_head_is_word_bounded():
+    # "cat" must match the standalone word, not the "cat" inside "vacation".
+    mu = MemoryUnit.__new__(MemoryUnit)
+    got = mu._extract_value("cat", "vacation: beach. The cat is fluffy")
+    assert got == "fluffy"
+
+
 def test_extract_value_falls_back_to_clause():
     # No email/number type match -> clause after the connector, trimmed.
     mu = MemoryUnit.__new__(MemoryUnit)  # no __init__ needed for the pure helper

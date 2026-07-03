@@ -41,30 +41,51 @@ def hydrated():
     api_module._owner_user_id = "user-1"
 
 
+@pytest.fixture
+def no_token_validation(monkeypatch):
+    """/learn requires a bearer token; these tests use a fake one, so turn off the
+    Google tokeninfo check (validated separately in test_api_token_validation)."""
+    monkeypatch.setenv("MEMORY_VALIDATE_TOKEN", "false")
+
+
+_AUTH = {"Authorization": "Bearer ya29.fake"}
+
+
 def test_learn_requires_user_id(client, hydrated):
-    resp = client.post("/learn", json={"items": [{"text": "x"}]})
+    resp = client.post("/learn", json={"items": [{"text": "x"}]}, headers=_AUTH)
     assert resp.status_code == 400
 
 
 def test_learn_wrong_user_is_forbidden(client, hydrated):
     resp = client.post(
-        "/learn", json={"items": [{"text": "x"}]}, headers={"X-User-Id": "user-2"}
+        "/learn",
+        json={"items": [{"text": "x"}]},
+        headers={**_AUTH, "X-User-Id": "user-2"},
     )
     assert resp.status_code == 403
 
 
-def test_learn_owner_succeeds(client, hydrated):
+def test_learn_without_token_is_401(client, hydrated):
+    resp = client.post(
+        "/learn", json={"items": [{"text": "x"}]}, headers={"X-User-Id": "user-1"}
+    )
+    assert resp.status_code == 401
+
+
+def test_learn_owner_succeeds(client, hydrated, no_token_validation):
     resp = client.post(
         "/learn",
         json={"items": [{"text": "Default recipient is a@b.com"}, {"text": "y"}]},
-        headers={"X-User-Id": "user-1"},
+        headers={**_AUTH, "X-User-Id": "user-1"},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["learned"] == 2
     assert len(api_module._memory_unit.learned) == 2
 
 
-def test_learn_lazy_inits_binds_owner_and_serves_resolve(client, tmp_path, monkeypatch):
+def test_learn_lazy_inits_binds_owner_and_serves_resolve(
+    client, tmp_path, monkeypatch, no_token_validation
+):
     # Fresh server: no _memory_unit, no owner. /learn should init the unit, claim
     # ownership, and make the fact resolvable — all without a Drive hydrate.
     monkeypatch.setattr(
@@ -74,7 +95,7 @@ def test_learn_lazy_inits_binds_owner_and_serves_resolve(client, tmp_path, monke
     r1 = client.post(
         "/learn",
         json={"items": [{"text": "Default recipient is zoe@example.com."}]},
-        headers={"X-User-Id": "u9"},
+        headers={**_AUTH, "X-User-Id": "u9"},
     )
     assert r1.status_code == 200, r1.text
     assert r1.json()["learned"] == 1
