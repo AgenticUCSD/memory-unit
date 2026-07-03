@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import api as api_module
 from api import app
+from memory_unit.core import MemoryUnit as RealMemoryUnit
 
 
 class FakeMemoryUnit:
@@ -61,3 +62,26 @@ def test_learn_owner_succeeds(client, hydrated):
     assert resp.status_code == 200, resp.text
     assert resp.json()["learned"] == 2
     assert len(api_module._memory_unit.learned) == 2
+
+
+def test_learn_lazy_inits_binds_owner_and_serves_resolve(client, tmp_path, monkeypatch):
+    # Fresh server: no _memory_unit, no owner. /learn should init the unit, claim
+    # ownership, and make the fact resolvable — all without a Drive hydrate.
+    monkeypatch.setattr(
+        api_module, "MemoryUnit", lambda *a, **k: RealMemoryUnit(persist_dir=str(tmp_path))
+    )
+
+    r1 = client.post(
+        "/learn",
+        json={"items": [{"text": "Default recipient is zoe@example.com."}]},
+        headers={"X-User-Id": "u9"},
+    )
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["learned"] == 1
+    assert api_module._owner_user_id == "u9"  # first writer claimed the unit
+
+    r2 = client.post(
+        "/resolve", json={"fields": ["recipient"]}, headers={"X-User-Id": "u9"}
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["slots"][0]["value"] == "zoe@example.com"

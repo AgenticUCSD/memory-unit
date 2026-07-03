@@ -346,7 +346,7 @@ class MemoryUnit:
         self,
         fields: List[str],
         user_id: Optional[str] = None,
-        scope: Optional[str] = None,
+        scope: Optional[List[str]] = None,
         min_score: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """Resolve task parameter *slots* to concrete values from indexed context.
@@ -365,12 +365,15 @@ class MemoryUnit:
         Args:
             fields: slot names to resolve (e.g. ["recipient", "meeting_duration"]).
             user_id: reserved for per-user isolation (single-tenant today).
-            scope: reserved for hierarchical scope (global|org|role|user|thread).
+            scope: optional **ordered** list of preferred scopes, most-specific
+                first (e.g. ["thread:T1", "user:U1", "global"]). When given,
+                evidence tagged with a more-specific scope wins over a less-specific
+                or unscoped one; unscoped evidence is always an allowed fallback.
             min_score: minimum BM25 score before a field counts as resolved.
 
         Returns:
-            One dict per input field: ``{field, value, source, confidence, status}``.
-            Unresolved fields come back with ``value=None`` and ``status="missing"``.
+            One dict per input field: ``{field, value, evidence, source, confidence,
+            scope, status}``. Unresolved fields come back ``status="missing"``.
         """
         resolved: List[Dict[str, Any]] = []
         for field in fields:
@@ -380,11 +383,12 @@ class MemoryUnit:
                 "evidence": None,
                 "source": None,
                 "confidence": 0.0,
+                "scope": None,
                 "status": "missing",
             }
 
-            if self.is_hydrated and field and field.strip():
-                best = self._best_evidence_for(field, min_score=min_score)
+            if self._servable() and field and field.strip():
+                best = self._best_evidence_for(field, min_score=min_score, scope=scope)
                 if best is not None:
                     item.update(best)
                     item["status"] = "present"
@@ -393,27 +397,62 @@ class MemoryUnit:
 
         return resolved
 
+    def _servable(self) -> bool:
+        """Whether the unit can serve resolve() — after a Drive hydrate OR once
+        seeded via learn() (write-back). Lets /learn make a fresh unit queryable
+        without a Drive round-trip."""
+        if self.is_hydrated or self.documents:
+            return True
+        try:
+            return self.vector_store.count() > 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _scope_rank(meta_scope: Optional[str], scope: List[str]) -> int:
+        """Preference rank of a hit's scope: lower = more preferred. Scopes listed
+        earlier (more specific) rank lower; an unlisted/unscoped hit ranks last but
+        is still allowed as a fallback."""
+        if meta_scope in scope:
+            return scope.index(meta_scope)
+        return len(scope)
+
     def _best_evidence_for(
-        self, field: str, min_score: float = 0.0
+        self, field: str, min_score: float = 0.0, scope: Optional[List[str]] = None
     ) -> Optional[Dict[str, Any]]:
         """Best supporting snippet for a slot name, or None.
 
         Keyword/BM25 first (deterministic, no embeddings); vector search is a
-        best-effort fallback when the keyword index yields nothing.
+        best-effort fallback when the keyword index yields nothing. When ``scope``
+        is given, a more-specific-scoped hit beats a higher-relevance but
+        less-specific one.
         """
         # Slot names are typically snake_case; the BM25 tokenizer drops "_"-joined
         # words, so search on a space-normalized query (e.g. "meeting_duration" ->
         # "meeting duration"). The original `field` still drives value extraction.
         query = field.replace("_", " ").strip() or field
 
-        hits = self.keyword_searcher.search(query, top_k=1)
-        if hits and float(hits[0].get("score", 0.0)) > min_score:
-            score = float(hits[0]["score"])
-            snippet = hits[0]["content"].strip()
+        hits = self.keyword_searcher.search(query, top_k=5 if scope else 1)
+        candidates = [h for h in hits if float(h.get("score", 0.0)) > min_score]
+        if candidates:
+            if scope:
+                # Prefer scope specificity first, then relevance.
+                chosen = min(
+                    candidates,
+                    key=lambda h: (
+                        self._scope_rank((h.get("metadata") or {}).get("scope"), scope),
+                        -float(h.get("score", 0.0)),
+                    ),
+                )
+            else:
+                chosen = candidates[0]
+            score = float(chosen["score"])
+            snippet = chosen["content"].strip()
             return {
                 "value": self._extract_value(field, snippet),
                 "evidence": snippet[:500],
                 "source": "context",
+                "scope": (chosen.get("metadata") or {}).get("scope"),
                 # Map an unbounded BM25 score monotonically into (0, 1).
                 "confidence": round(score / (score + 1.0), 3),
             }
@@ -431,6 +470,7 @@ class MemoryUnit:
                     "value": self._extract_value(field, snippet),
                     "evidence": snippet[:500],
                     "source": "context",
+                    "scope": None,
                     "confidence": round(1.0 / (1.0 + distance), 3),
                 }
         except Exception:
@@ -523,14 +563,21 @@ class MemoryUnit:
                 continue
             seen.add(h)
             records.append(
-                {"hash": h, "text": text, "category": item.get("category"), "task_id": item.get("task_id")}
+                {
+                    "hash": h,
+                    "text": text,
+                    "category": item.get("category"),
+                    "task_id": item.get("task_id"),
+                    "scope": item.get("scope"),
+                }
             )
 
         if not records:
             return 0
 
         docs = [self._learned_doc(r) for r in records]
-        self._index_documents(docs)
+        scopes = [r.get("scope") for r in records]
+        self._index_documents(docs, scopes)
         self.documents.extend(docs)
         self._persist_learned(records)
         return len(records)
@@ -546,10 +593,18 @@ class MemoryUnit:
             chunk_index=0,
         )
 
-    def _index_documents(self, docs: List[ContextDocument]) -> None:
-        """Add docs to the vector store (best-effort) and rebuild the keyword index."""
+    def _index_documents(
+        self, docs: List[ContextDocument], scopes: Optional[List[Optional[str]]] = None
+    ) -> None:
+        """Add docs to the vector store (best-effort) and rebuild the keyword index.
+
+        ``scopes`` (parallel to ``docs``) tags each doc's keyword metadata with a
+        scope label used by resolve()'s hierarchical scope preference.
+        """
         if not docs:
             return
+        if scopes is None:
+            scopes = [None] * len(docs)
         # Vector add can fail without a usable embeddings backend; the keyword
         # (BM25) path is the deterministic one resolve() uses first, so guard it.
         try:
@@ -564,8 +619,9 @@ class MemoryUnit:
                 "filename": d.filename,
                 "folder": d.folder,
                 "is_preference": d.folder == "machine_generated",
+                "scope": scopes[i],
             }
-            for d in docs
+            for i, d in enumerate(docs)
         ]
         self.keyword_searcher.index_documents(texts, metas)
 
@@ -600,7 +656,7 @@ class MemoryUnit:
         """Re-ingest persisted learned blocks into the (freshly rebuilt) index."""
         if not self._learned_path or not os.path.exists(self._learned_path):
             return
-        docs = []
+        docs, scopes = [], []
         with open(self._learned_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -609,8 +665,9 @@ class MemoryUnit:
                 rec = json.loads(line)
                 if (rec.get("text") or "").strip():
                     docs.append(self._learned_doc(rec))
+                    scopes.append(rec.get("scope"))
         if docs:
-            self._index_documents(docs)
+            self._index_documents(docs, scopes)
             self.documents.extend(docs)
 
     def _build_task_identifier_context(
