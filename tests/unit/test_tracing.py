@@ -32,3 +32,30 @@ def test_traced_preserves_behavior_when_disabled(monkeypatch):
 
     assert add(2, 3) == 5
     assert calls == [(2, 3)]
+
+
+def test_traced_falls_back_when_span_raises(monkeypatch):
+    """A tracing failure (e.g. deepeval 'span must have a valid trace') must never
+    propagate — the wrapped function still runs and returns normally."""
+    monkeypatch.setenv("CONFIDENT_API_KEY", "fake-key")
+    monkeypatch.setenv("MEMORY_TRACING", "true")
+    monkeypatch.setattr(tracing, "_HAS_DEEPEVAL", True)
+
+    def boom_observe(name=None, type=None):
+        def deco(fn):
+            def obs(*a, **k):
+                raise ValueError("A span must have a valid trace.")
+            return obs
+        return deco
+
+    monkeypatch.setattr(tracing, "_observe", boom_observe)
+
+    calls = []
+
+    @tracing.traced(name="retrieval.test")
+    def fetch(x):
+        calls.append(x)
+        return x * 3
+
+    assert fetch(7) == 21
+    assert calls == [7]

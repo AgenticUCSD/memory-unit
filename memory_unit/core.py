@@ -28,7 +28,7 @@ from memory_unit.processing.document_processor import DocumentProcessor
 from memory_unit.processing.preference_analyzer import PreferenceAnalyzer
 from memory_unit.drive.client import GoogleDriveClient
 from memory_unit.agents.tools import MemoryTools, QueryResult
-from memory_unit.tracing import tracing_callbacks, traced
+from memory_unit.tracing import tracing_callbacks, traced, tag_current_trace_thread
 
 
 class MemoryUnit:
@@ -308,7 +308,10 @@ class MemoryUnit:
         # Attach DeepEval tracing (no-op when tracing is off) and correlate to the
         # caller's thread_id so these spans join the pipeline's trace. Merge into
         # the existing config — do not replace recursion_limit.
-        config: Dict[str, Any] = {"recursion_limit": 12, "callbacks": tracing_callbacks()}
+        config: Dict[str, Any] = {
+            "recursion_limit": 12,
+            "callbacks": tracing_callbacks(thread_id),
+        }
         if thread_id:
             config["configurable"] = {"thread_id": thread_id}
 
@@ -354,6 +357,7 @@ class MemoryUnit:
             workflow_trends=[p.raw_content[:500] for p in workflow_trends]
         )
 
+    @traced(name="memory.resolve")
     def resolve(
         self,
         fields: List[str],
@@ -391,6 +395,9 @@ class MemoryUnit:
             One dict per input field: ``{field, value, evidence, source, confidence,
             scope, status}``. Unresolved fields come back ``status="missing"``.
         """
+        # Correlate this (agent-less, deterministic) span to the pipeline thread.
+        tag_current_trace_thread(thread_id)
+
         resolved: List[Dict[str, Any]] = []
         for field in fields:
             item: Dict[str, Any] = {
@@ -433,7 +440,6 @@ class MemoryUnit:
             return scope.index(meta_scope)
         return len(scope)
 
-    @traced(name="retrieval.resolve.best_evidence")
     def _best_evidence_for(
         self, field: str, min_score: float = 0.0, scope: Optional[List[str]] = None
     ) -> Optional[Dict[str, Any]]:
