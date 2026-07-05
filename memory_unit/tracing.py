@@ -18,15 +18,17 @@ from __future__ import annotations
 
 import os
 from functools import wraps
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 
 try:  # optional dependency; keep memory-unit importable without it
     from deepeval.integrations.langchain import CallbackHandler as _CallbackHandler
     from deepeval.tracing import observe as _observe
+    from deepeval.tracing import update_current_trace as _update_current_trace
     _HAS_DEEPEVAL = True
 except Exception:  # pragma: no cover - import guard
     _CallbackHandler = None
     _observe = None
+    _update_current_trace = None
     _HAS_DEEPEVAL = False
 
 
@@ -49,15 +51,31 @@ def tracing_enabled() -> bool:
     )
 
 
-def tracing_callbacks() -> List[Any]:
-    """LangChain callbacks to attach to an agent invoke — ``[CallbackHandler()]``
-    when tracing is enabled, else ``[]``. Never raises."""
+def tracing_callbacks(thread_id: Optional[str] = None) -> List[Any]:
+    """LangChain callbacks to attach to an agent invoke — ``[CallbackHandler(...)]``
+    when tracing is enabled, else ``[]``. Never raises.
+
+    ``thread_id`` is passed to the CallbackHandler *constructor* — deepeval groups
+    spans by that, not by LangChain's ``configurable.thread_id``."""
     if not tracing_enabled():
         return []
     try:
-        return [_CallbackHandler()]
+        return [_CallbackHandler(thread_id=thread_id)] if thread_id else [_CallbackHandler()]
     except Exception:  # pragma: no cover - defensive: never fail on tracing
         return []
+
+
+def tag_current_trace_thread(thread_id: Optional[str]) -> None:
+    """Best-effort: tag the currently-active DeepEval trace with ``thread_id`` so a
+    manual span (e.g. the deterministic resolve path, which has no LangChain agent)
+    lands on the same thread as the rest of the pipeline. No-op / never raises when
+    tracing is off, there is no active trace, or deepeval is absent."""
+    if not thread_id or not tracing_enabled() or _update_current_trace is None:
+        return
+    try:
+        _update_current_trace(thread_id=thread_id)
+    except Exception:  # pragma: no cover - defensive: never fail on tracing
+        return
 
 
 def traced(name: str) -> Callable:
@@ -78,9 +96,18 @@ def traced(name: str) -> Callable:
 
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            if tracing_enabled():
+            if not tracing_enabled():
+                return fn(*args, **kwargs)
+            try:
                 return observed(*args, **kwargs)
-            return fn(*args, **kwargs)
+            except Exception:
+                # Tracing must never break the call. deepeval's span machinery can
+                # raise (e.g. "a span must have a valid trace" when there is no
+                # active parent trace, or a stale trace context left by a prior
+                # LangChain CallbackHandler run). Fall back to the untraced call.
+                # The functions traced here are idempotent reads, so the fallback
+                # is safe even if `observed` failed after invoking `fn`.
+                return fn(*args, **kwargs)
 
         return wrapper
 
