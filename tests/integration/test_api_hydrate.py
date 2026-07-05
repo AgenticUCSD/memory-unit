@@ -36,7 +36,7 @@ class FakeMemoryUnit:
         self.folder_config = None
         self.hydrate_calls = []
 
-    def hydrate_from_drive(self, root_folder_id, auth_token):
+    def hydrate_from_drive(self, root_folder_id, auth_token, thread_id=None, **_):
         # Mirror the real signature + side effects relied on by /refresh.
         self.hydrate_calls.append((root_folder_id, auth_token))
         self.auth_token = auth_token

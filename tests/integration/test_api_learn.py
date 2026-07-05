@@ -16,7 +16,7 @@ class FakeMemoryUnit:
     def __init__(self):
         self.learned = []
 
-    def learn(self, items):
+    def learn(self, items, thread_id=None, **_):
         self.learned.extend(items)
         return len(items)
 

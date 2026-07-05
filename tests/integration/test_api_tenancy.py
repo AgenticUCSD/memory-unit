@@ -16,7 +16,7 @@ from api import app
 class FakeMemoryUnit:
     """Stand-in exposing just what /query and /stats touch."""
 
-    def query(self, query_text):
+    def query(self, query_text, thread_id=None, **_):
         return SimpleNamespace(
             answer="ok",
             sources=[],

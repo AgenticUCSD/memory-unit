@@ -12,7 +12,7 @@ from api import app
 
 
 class FakeMemoryUnit:
-    def resolve(self, fields, user_id=None, scope=None, min_score=0.0):
+    def resolve(self, fields, user_id=None, scope=None, min_score=0.0, thread_id=None, **_):
         return [
             {
                 "field": f,
