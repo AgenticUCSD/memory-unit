@@ -19,6 +19,11 @@ requests>=2.32.0
 # Environment
 python-dotenv>=1.0.0
 
+# Observability / tracing (Phase 5) — pinned to match workflow-provider.
+# Optional at runtime: memory_unit/tracing.py imports it behind try/except and
+# only traces when CONFIDENT_API_KEY is set, so a missing/failed import is safe.
+deepeval==4.0.6
+
 # Data validation
 pydantic>=2.9.0
 

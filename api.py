@@ -285,7 +285,9 @@ def hydrate_memory(
         )
 
         # Hydrate from Drive (root folder id + ephemeral token).
-        result = _memory_unit.hydrate_from_drive(request.root_folder_id, auth_token)
+        result = _memory_unit.hydrate_from_drive(
+            request.root_folder_id, auth_token, thread_id=x_thread_id
+        )
 
         # Claim ownership only after a successful hydrate, so a failed hydrate doesn't
         # lock the unit to a user with no data.
@@ -307,7 +309,12 @@ def hydrate_memory(
 # =============================================================================
 
 @app.post("/query", response_model=ContextResponse)
-def query_memory(request: QueryRequest, memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends(require_owner)):
+def query_memory(
+    request: QueryRequest,
+    memory: MemoryUnit = Depends(get_memory_unit),
+    _: str = Depends(require_owner),
+    x_thread_id: Optional[str] = Header(None),
+):
     """
     Query the memory unit using agentic RAG.
 
@@ -315,7 +322,7 @@ def query_memory(request: QueryRequest, memory: MemoryUnit = Depends(get_memory_
     retrieval from machine-generated preference/trend files.
     """
     try:
-        result = memory.query(request.query)
+        result = memory.query(request.query, thread_id=x_thread_id)
         return ContextResponse(
             answer=result.answer,
             sources=result.sources,
@@ -336,6 +343,7 @@ def resolve_slots(
     request: ResolveRequest,
     x_user_id: str = Depends(require_owner),
     memory: MemoryUnit = Depends(get_memory_unit),
+    x_thread_id: Optional[str] = Header(None),
 ):
     """Resolve task parameter slots to concrete values (structured field->value).
 
@@ -350,6 +358,7 @@ def resolve_slots(
             user_id=x_user_id,
             scope=request.scope,
             min_score=request.min_score,
+            thread_id=x_thread_id,
         )
         return ResolveResponse(slots=[ResolvedSlot(**r) for r in results])
     except Exception as e:
@@ -362,6 +371,7 @@ def learn_context(
     request: LearnRequest,
     authorization: Optional[str] = Header(None),
     x_user_id: str = Depends(require_owner),
+    x_thread_id: Optional[str] = Header(None),
 ):
     """Write-back: ingest distilled context learned from completed tasks so future
     resolve()/query() calls benefit. In-repo self-learning; durable Drive
@@ -385,7 +395,9 @@ def learn_context(
         memory = _ensure_memory_unit()
         if _owner_user_id is None:
             _owner_user_id = x_user_id
-        count = memory.learn([item.model_dump() for item in request.items])
+        count = memory.learn(
+            [item.model_dump() for item in request.items], thread_id=x_thread_id
+        )
         return LearnResponse(learned=count)
     except HTTPException:
         raise
@@ -554,7 +566,8 @@ def clear_memory(memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends
 def refresh_memory(
     authorization: Optional[str] = Header(None),
     memory: MemoryUnit = Depends(get_memory_unit),
-    x_user_id: str = Depends(require_owner)
+    x_user_id: str = Depends(require_owner),
+    x_thread_id: Optional[str] = Header(None),
 ):
     """Refresh memory by re-hydrating from Drive."""
     try:
@@ -583,7 +596,7 @@ def refresh_memory(
             )
 
         # Re-hydrate (clears old data internally) with the root folder + token.
-        result = memory.hydrate_from_drive(root_folder_id, auth_token)
+        result = memory.hydrate_from_drive(root_folder_id, auth_token, thread_id=x_thread_id)
 
         # Spread result first so its "status": "success" does not clobber "refreshed".
         return {

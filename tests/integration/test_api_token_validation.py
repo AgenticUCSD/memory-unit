@@ -21,7 +21,7 @@ class FakeMemoryUnit:
         self.root_folder_id = None
         self.folder_config = None
 
-    def hydrate_from_drive(self, root_folder_id, auth_token):
+    def hydrate_from_drive(self, root_folder_id, auth_token, thread_id=None, **_):
         return {
             "status": "success",
             "documents_indexed": 1,

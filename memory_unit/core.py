@@ -28,6 +28,7 @@ from memory_unit.processing.document_processor import DocumentProcessor
 from memory_unit.processing.preference_analyzer import PreferenceAnalyzer
 from memory_unit.drive.client import GoogleDriveClient
 from memory_unit.agents.tools import MemoryTools, QueryResult
+from memory_unit.tracing import tracing_callbacks, traced
 
 
 class MemoryUnit:
@@ -91,7 +92,8 @@ class MemoryUnit:
     def hydrate_from_drive(
         self,
         root_folder_id: str,
-        auth_token: str
+        auth_token: str,
+        thread_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Hydrate the memory unit from Google Drive.
@@ -271,7 +273,7 @@ class MemoryUnit:
             tools=self.memory_tools.get_tools()
         )
 
-    def query(self, query_text: str) -> ContextQueryResult:
+    def query(self, query_text: str, thread_id: Optional[str] = None) -> ContextQueryResult:
         """
         Query the memory unit using agentic RAG.
 
@@ -279,6 +281,9 @@ class MemoryUnit:
         - Vector/keyword search treats all documents equally
         - Preference metadata enriches component-specific context
         - Agent routes to best sources regardless of folder
+
+        ``thread_id`` (from the caller's ``X-Thread-Id``) correlates this agent's
+        DeepEval spans with the rest of the pipeline's trace, when tracing is on.
         """
         if not self.is_hydrated:
             return ContextQueryResult(
@@ -300,9 +305,16 @@ class MemoryUnit:
 
         chat = [{"role": "user", "content": content}]
 
+        # Attach DeepEval tracing (no-op when tracing is off) and correlate to the
+        # caller's thread_id so these spans join the pipeline's trace. Merge into
+        # the existing config — do not replace recursion_limit.
+        config: Dict[str, Any] = {"recursion_limit": 12, "callbacks": tracing_callbacks()}
+        if thread_id:
+            config["configurable"] = {"thread_id": thread_id}
+
         result = self.query_agent.invoke(
             {"messages": chat},
-            config={"recursion_limit": 12}
+            config=config,
         )
 
         # Extract result
@@ -348,6 +360,7 @@ class MemoryUnit:
         user_id: Optional[str] = None,
         scope: Optional[List[str]] = None,
         min_score: float = 0.0,
+        thread_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Resolve task parameter *slots* to concrete values from indexed context.
 
@@ -370,6 +383,9 @@ class MemoryUnit:
                 evidence tagged with a more-specific scope wins over a less-specific
                 or unscoped one; unscoped evidence is always an allowed fallback.
             min_score: minimum BM25 score before a field counts as resolved.
+            thread_id: caller's ``X-Thread-Id`` for trace correlation (accepted so
+                the provider's forwarded header is no longer dropped; used by the
+                retrieval span when tracing is enabled).
 
         Returns:
             One dict per input field: ``{field, value, evidence, source, confidence,
@@ -417,6 +433,7 @@ class MemoryUnit:
             return scope.index(meta_scope)
         return len(scope)
 
+    @traced(name="retrieval.resolve.best_evidence")
     def _best_evidence_for(
         self, field: str, min_score: float = 0.0, scope: Optional[List[str]] = None
     ) -> Optional[Dict[str, Any]]:
@@ -543,9 +560,12 @@ class MemoryUnit:
                 fallback = tok
         return fallback
 
-    def learn(self, items: List[Dict[str, Any]]) -> int:
+    def learn(self, items: List[Dict[str, Any]], thread_id: Optional[str] = None) -> int:
         """Write-back: ingest distilled 'learned' context so future resolve()/query()
         calls benefit (self-learning).
+
+        ``thread_id`` (caller's ``X-Thread-Id``) is accepted for trace correlation
+        and API symmetry; the ingest path itself is deterministic (no LLM).
 
         Each item is ``{text, category?, task_id?}``. Blocks are added to the
         unified index (vector + keyword) and appended to a durable JSONL in

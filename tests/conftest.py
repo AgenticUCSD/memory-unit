@@ -2,6 +2,14 @@
 Shared test fixtures and configuration.
 """
 
+import os
+
+# Never emit or flush real traces during tests. deepeval loads the repo `.env`
+# (which may carry a CONFIDENT_API_KEY) on import, which would otherwise make
+# tracing_enabled() true; force it off for the whole test session. setdefault
+# keeps an explicit MEMORY_TRACING from the caller respected.
+os.environ.setdefault("MEMORY_TRACING", "false")
+
 import pytest
 from unittest.mock import Mock
 from memory_unit.models.documents import ContextDocument, FolderSummary
