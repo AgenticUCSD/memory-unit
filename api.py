@@ -284,6 +284,10 @@ def hydrate_memory(
             machine_generated_folder_id=""
         )
 
+        # Bind the owner so the (shared) pg learned store scopes reads/writes to this
+        # user before the hydrate re-loads learned context; inert for the JSONL store.
+        _memory_unit.user_id = x_user_id
+
         # Hydrate from Drive (root folder id + ephemeral token).
         result = _memory_unit.hydrate_from_drive(
             request.root_folder_id, auth_token, thread_id=x_thread_id
@@ -395,6 +399,8 @@ def learn_context(
         memory = _ensure_memory_unit()
         if _owner_user_id is None:
             _owner_user_id = x_user_id
+        # Scope this write to the owner in the shared pg store (inert for JSONL).
+        memory.user_id = x_user_id
         count = memory.learn(
             [item.model_dump() for item in request.items], thread_id=x_thread_id
         )

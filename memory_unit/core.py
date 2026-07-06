@@ -24,6 +24,7 @@ from memory_unit.models.documents import ContextDocument, FolderSummary
 from memory_unit.models.query import ContextQueryResult, DriveFolderConfig
 from memory_unit.storage.vector_store import VectorStore
 from memory_unit.storage.bm25_search import BM25Searcher
+from memory_unit.storage.learned_store import make_learned_store
 from memory_unit.processing.document_processor import DocumentProcessor
 from memory_unit.processing.preference_analyzer import PreferenceAnalyzer
 from memory_unit.drive.client import GoogleDriveClient
@@ -61,10 +62,15 @@ class MemoryUnit:
         self.root_folder_id: Optional[str] = None
         self.persist_dir = persist_dir
         self.model_name = model_name
+        # Bound owner (Google sub); set by the API on hydrate/learn. Used only to scope
+        # the shared pg learned store; the default per-instance JSONL store ignores it.
+        self.user_id: Optional[str] = None
         # Durable store for write-back ("learned") context, re-applied on hydrate.
+        # Backend chosen by STORE_BACKEND (default: per-instance JSONL in persist_dir).
         self._learned_path = (
             os.path.join(persist_dir, "learned_context.jsonl") if persist_dir else None
         )
+        self._learned_store = make_learned_store(persist_dir)
 
         # Initialize persistent components that don't need auth
         self.vector_store = VectorStore(persist_dir=persist_dir)
@@ -657,52 +663,18 @@ class MemoryUnit:
         self.keyword_searcher.index_documents(texts, metas)
 
     def _learned_hashes(self) -> set:
-        if not self._learned_path or not os.path.exists(self._learned_path):
-            return set()
-        hashes = set()
-        try:
-            with open(self._learned_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue  # skip a corrupt/partial line, keep the rest
-                    if rec.get("hash"):
-                        hashes.add(rec["hash"])
-        except OSError:
-            return hashes
-        return hashes
+        return self._learned_store.hashes(self.user_id)
 
     def _persist_learned(self, records: List[Dict[str, Any]]) -> None:
-        if not self._learned_path:
-            return
-        try:
-            with open(self._learned_path, "a", encoding="utf-8") as f:
-                for rec in records:
-                    f.write(json.dumps(rec) + "\n")
-        except Exception as e:
-            print(f"Failed to persist learned context: {e}")
+        self._learned_store.append(records, self.user_id)
 
     def _reload_learned(self) -> None:
         """Re-ingest persisted learned blocks into the (freshly rebuilt) index."""
-        if not self._learned_path or not os.path.exists(self._learned_path):
-            return
         docs, scopes = [], []
-        with open(self._learned_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue  # skip a corrupt line, don't drop the rest
-                if (rec.get("text") or "").strip():
-                    docs.append(self._learned_doc(rec))
-                    scopes.append(rec.get("scope"))
+        for rec in self._learned_store.load(self.user_id):
+            if (rec.get("text") or "").strip():
+                docs.append(self._learned_doc(rec))
+                scopes.append(rec.get("scope"))
         if docs:
             self._index_documents(docs, scopes)
             self.documents.extend(docs)
