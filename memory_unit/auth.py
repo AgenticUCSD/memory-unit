@@ -96,6 +96,11 @@ def verify_google_token(token: str, x_user_id: str) -> None:
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid token info response")
 
+    # Cross-check `sub` when present. INTENTIONALLY lenient when it is absent: a
+    # Google access token carrying only API scopes (e.g. gmail/calendar, no openid)
+    # does not return `sub` from tokeninfo, and we then trust X-User-Id — matching
+    # the executor's `services/auth.py` on purpose. Do NOT make `sub` mandatory: it
+    # would reject those valid API-scope tokens and diverge from the live reference.
     sub = info.get("sub")
     if sub and sub != x_user_id:
         raise HTTPException(status_code=401, detail="User ID does not match token")

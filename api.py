@@ -268,6 +268,17 @@ def hydrate_memory(
     # 503 if Google is unreachable.
     verify_google_token(auth_token, x_user_id)
 
+    # Single-tenant: a *different* user must not take over (or wipe) the unit that
+    # another user already hydrated. Same user may re-hydrate. Checked after auth
+    # (so we don't leak ownership state to an unauthenticated caller) and before we
+    # re-create _memory_unit (so a rejected takeover can't destroy the incumbent's
+    # data). Proper multi-tenant isolation is the deferred pg per-user store.
+    if _owner_user_id is not None and x_user_id != _owner_user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This memory unit was hydrated for a different user.",
+        )
+
     try:
         logger.info(f"Initializing memory unit with folder: {request.root_folder_id}")
 
@@ -577,18 +588,15 @@ def refresh_memory(
 ):
     """Refresh memory by re-hydrating from Drive."""
     try:
+        # Use a freshly-supplied token if present, else fall back to the one captured
+        # at hydrate. Verify whichever we're about to use: the stored token may have
+        # expired since hydrate, so verifying it turns expiry into a clean 401
+        # ("re-authenticate") instead of a 500 from a failed Drive call downstream.
         supplied_token = extract_bearer_token(authorization)
-
-        if supplied_token:
-            # A freshly-supplied token must be verified (and belong to the owner).
-            verify_google_token(supplied_token, x_user_id)
-            auth_token = supplied_token
-        else:
-            # Fall back to the token already verified at hydrate time.
-            auth_token = memory.auth_token
-
+        auth_token = supplied_token or memory.auth_token
         if not auth_token:
             raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
+        verify_google_token(auth_token, x_user_id)
 
         # Resolve the root folder id captured at the last hydrate. Without it there
         # is nothing to refresh — the caller must hydrate first.

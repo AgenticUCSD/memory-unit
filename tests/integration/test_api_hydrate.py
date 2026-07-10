@@ -12,6 +12,7 @@ ChromaDB, no Google Drive, and no OpenAI key are required.
 from unittest.mock import patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import api as api_module
@@ -124,3 +125,67 @@ def test_refresh_reuses_stored_root_folder(client):
     assert resp.json()["status"] == "refreshed"
     # Refresh re-hydrates the same folder with the new token, no folder id needed.
     assert api_module._memory_unit.hydrate_calls[-1] == ("root123", "ya29.second")
+
+
+# ── single-tenant owner guard on /hydrate (takeover prevention) ──
+
+def test_hydrate_by_different_user_is_forbidden(client):
+    with patch.object(api_module, "MemoryUnit", FakeMemoryUnit):
+        r1 = client.post(
+            "/hydrate",
+            json={"root_folder_id": "root123"},
+            headers={"Authorization": "Bearer ya29.a", "X-User-Id": "user-1"},
+        )
+        assert r1.status_code == 200, r1.text
+        first_unit = api_module._memory_unit
+
+        # A different valid-token user must NOT be able to take over / wipe the unit.
+        r2 = client.post(
+            "/hydrate",
+            json={"root_folder_id": "rootZZZ"},
+            headers={"Authorization": "Bearer ya29.b", "X-User-Id": "user-2"},
+        )
+
+    assert r2.status_code == 403
+    # Incumbent owner + unit are untouched (no takeover, no re-create/wipe).
+    assert api_module._owner_user_id == "user-1"
+    assert api_module._memory_unit is first_unit
+
+
+def test_same_user_can_rehydrate(client):
+    with patch.object(api_module, "MemoryUnit", FakeMemoryUnit):
+        r1 = client.post(
+            "/hydrate",
+            json={"root_folder_id": "root123"},
+            headers={"Authorization": "Bearer ya29.a", "X-User-Id": "user-1"},
+        )
+        r2 = client.post(
+            "/hydrate",
+            json={"root_folder_id": "root123"},
+            headers={"Authorization": "Bearer ya29.a2", "X-User-Id": "user-1"},
+        )
+
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text  # the owner may re-hydrate
+    assert api_module._owner_user_id == "user-1"
+
+
+def test_refresh_with_expired_stored_token_returns_401(client, monkeypatch):
+    # A unit hydrated earlier, whose stored token has since expired.
+    unit = FakeMemoryUnit()
+    unit.auth_token = "ya29.stored-expired"
+    unit.root_folder_id = "root123"
+    api_module._memory_unit = unit
+    api_module._owner_user_id = "user-1"
+
+    def expired(token, x_user_id):
+        raise HTTPException(status_code=401, detail="Invalid or expired access token")
+
+    # Override the (env-disabled) no-op so the expired stored token is actually checked.
+    monkeypatch.setattr(api_module, "verify_google_token", expired)
+
+    # No Authorization header -> falls back to the stored (now expired) token.
+    resp = client.post("/refresh", headers={"X-User-Id": "user-1"})
+
+    # The fix: a clean 401 ("re-authenticate"), not a 500 from a failed Drive call.
+    assert resp.status_code == 401, resp.text
