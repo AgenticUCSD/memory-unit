@@ -112,3 +112,82 @@ def test_resolve_prefers_more_specific_scope(tmp_path):
     assert slot["status"] == "present"
     assert "PROJ-USER-9" in slot["value"]
     assert slot["scope"] == "user"
+
+
+# ── LLM value extraction (opt-in via MEMORY_RESOLVE_LLM; deterministic fallback) ──
+
+
+def test_resolve_llm_disabled_is_deterministic(tmp_path, monkeypatch):
+    # Flag OFF (default): even if the LLM extractor *would* return something else,
+    # resolve() uses the deterministic value.
+    monkeypatch.delenv("MEMORY_RESOLVE_LLM", raising=False)
+    mu = _hydrated_unit(tmp_path)
+    monkeypatch.setattr(mu, "_extract_value_llm", lambda field, text: "LLM-SHOULD-NOT-RUN")
+    slot = mu.resolve(["recipient"])[0]
+    assert slot["value"] == "alice@example.com"  # deterministic, LLM never consulted
+
+
+def test_resolve_value_uses_llm_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORY_RESOLVE_LLM", "true")
+    mu = _hydrated_unit(tmp_path)
+    monkeypatch.setattr(mu, "_extract_value_llm", lambda field, text: "alice (from LLM)")
+    slot = mu.resolve(["recipient"])[0]
+    assert slot["value"] == "alice (from LLM)"
+    # Evidence is still the original snippet, not the LLM output.
+    assert "Default recipient" in slot["evidence"]
+
+
+def test_resolve_value_falls_back_when_llm_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORY_RESOLVE_LLM", "true")
+    mu = _hydrated_unit(tmp_path)
+    monkeypatch.setattr(mu, "_extract_value_llm", lambda field, text: None)
+    slot = mu.resolve(["recipient"])[0]
+    assert slot["value"] == "alice@example.com"  # deterministic fallback
+
+
+class _FakeMsg:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeLLM:
+    """Records the prompt and returns a canned content (or raises)."""
+
+    def __init__(self, content=None, raises=False):
+        self._content = content
+        self._raises = raises
+
+    def invoke(self, prompt):
+        if self._raises:
+            raise RuntimeError("boom")
+        return _FakeMsg(self._content)
+
+
+def _bare_unit():
+    mu = MemoryUnit.__new__(MemoryUnit)  # no __init__ / no key needed
+    mu.model_name = "gpt-4o"
+    return mu
+
+
+def test_extract_value_llm_parses_content():
+    mu = _bare_unit()
+    mu._extractor_llm = _FakeLLM(content='  "bob@x.com" ')
+    assert mu._extract_value_llm("recipient", "email bob@x.com somewhere") == "bob@x.com"
+
+
+def test_extract_value_llm_none_reply_is_none():
+    mu = _bare_unit()
+    mu._extractor_llm = _FakeLLM(content="NONE")
+    assert mu._extract_value_llm("recipient", "no email here") is None
+
+
+def test_extract_value_llm_error_is_none():
+    mu = _bare_unit()
+    mu._extractor_llm = _FakeLLM(raises=True)
+    assert mu._extract_value_llm("recipient", "anything") is None
+
+
+def test_extract_value_llm_empty_text_is_none():
+    mu = _bare_unit()
+    mu._extractor_llm = _FakeLLM(content="should-not-matter")
+    assert mu._extract_value_llm("recipient", "   ") is None
