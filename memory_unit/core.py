@@ -32,6 +32,25 @@ from memory_unit.agents.tools import MemoryTools, QueryResult
 from memory_unit.tracing import tracing_callbacks, traced, tag_current_trace_thread
 
 
+def resolve_llm_enabled() -> bool:
+    """Whether resolve() may use the LLM value extractor (opt-in).
+
+    Default OFF so extraction stays deterministic/offline unless explicitly enabled
+    with ``MEMORY_RESOLVE_LLM=1/true/yes/on``. Even when on, the deterministic
+    ``_extract_value`` remains the fallback (missing key / empty / error).
+    """
+    return os.getenv("MEMORY_RESOLVE_LLM", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+# Sentinel distinguishing "extractor LLM not yet built" from "built and failed (None)".
+_UNSET = object()
+
+
 class MemoryUnit:
     """
     Agentic RAG Memory Unit.
@@ -380,10 +399,11 @@ class MemoryUnit:
         (HITL). Each result carries ``source`` and a bounded ``confidence`` so the
         caller can decide whether to trust the value or still ask.
 
-        Deliberately deterministic — keyword/BM25 over the unified index, no LLM —
-        so it is cheap and testable offline. LLM-based value *extraction* from the
-        matched evidence is a follow-up; today ``value`` is the best matching
-        context snippet.
+        Evidence *selection* is deterministic — keyword/BM25 over the unified index
+        (vector fallback), so it is cheap and testable offline. Value *extraction*
+        from the matched evidence is deterministic by default (`_extract_value`); an
+        opt-in LLM extractor (`MEMORY_RESOLVE_LLM`) can produce cleaner values, with
+        the deterministic path as the fallback (missing key / empty / error).
 
         Args:
             fields: slot names to resolve (e.g. ["recipient", "meeting_duration"]).
@@ -478,7 +498,7 @@ class MemoryUnit:
             score = float(chosen["score"])
             snippet = chosen["content"].strip()
             return {
-                "value": self._extract_value(field, snippet),
+                "value": self._resolve_value(field, snippet),
                 "evidence": snippet[:500],
                 "source": "context",
                 "scope": (chosen.get("metadata") or {}).get("scope"),
@@ -496,7 +516,7 @@ class MemoryUnit:
                 snippet = docs[0][0].strip()
                 # Chroma distances are >= 0 (smaller = closer). Convert to (0, 1].
                 return {
-                    "value": self._extract_value(field, snippet),
+                    "value": self._resolve_value(field, snippet),
                     "evidence": snippet[:500],
                     "source": "context",
                     "scope": None,
@@ -506,6 +526,64 @@ class MemoryUnit:
             pass
 
         return None
+
+    def _resolve_value(self, field: str, text: str) -> str:
+        """Concise value for ``field`` from evidence ``text``.
+
+        Uses the LLM extractor when ``MEMORY_RESOLVE_LLM`` is on *and* it yields a
+        value; otherwise (and always, as fallback) the deterministic
+        ``_extract_value``. Selection/confidence/evidence are unchanged either way.
+        """
+        if resolve_llm_enabled():
+            v = self._extract_value_llm(field, text)
+            if v:
+                return v
+        return self._extract_value(field, text)
+
+    def _get_extractor_llm(self):
+        """Lazily build (once) a guarded ChatOpenAI for value extraction. Returns the
+        LLM, or None if it can't be constructed (e.g. no ``OPENAI_API_KEY``). Cached
+        either way so a missing key doesn't retry-thrash."""
+        llm = getattr(self, "_extractor_llm", _UNSET)
+        if llm is not _UNSET:
+            return llm
+        try:
+            self._extractor_llm = ChatOpenAI(model=self.model_name, temperature=0)
+        except Exception:
+            self._extractor_llm = None
+        return self._extractor_llm
+
+    def _extract_value_llm(self, field: str, text: str) -> Optional[str]:
+        """LLM extraction of a concise value for ``field`` from evidence ``text``.
+
+        Returns a stripped value, or ``None`` when the extractor is unavailable, the
+        snippet has no value for the field (model replies ``NONE``), or anything
+        errors — so the caller falls back to the deterministic extractor. Never raises.
+        """
+        text = " ".join((text or "").split())
+        if not text:
+            return None
+        llm = self._get_extractor_llm()
+        if llm is None:
+            return None
+        prompt = (
+            'Extract the value of the field "{field}" from the context snippet below. '
+            "Return ONLY the value (e.g. an email address, a duration, a name, a "
+            "number) with no extra words. If the snippet contains no value for this "
+            "field, reply with exactly NONE.\n\n"
+            'Field: {field}\nSnippet: """{text}"""'
+        ).format(field=field, text=text[:1000])
+        try:
+            resp = llm.invoke(prompt)
+        except Exception:
+            return None
+        content = getattr(resp, "content", resp)
+        if not isinstance(content, str):
+            content = str(content)
+        value = content.strip().strip('"').strip()
+        if not value or value.upper() == "NONE":
+            return None
+        return value[:200]
 
     def _extract_value(self, field: str, text: str) -> str:
         """Best-effort concise value for ``field`` from an evidence snippet.
