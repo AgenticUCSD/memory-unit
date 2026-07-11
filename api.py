@@ -90,7 +90,14 @@ def _get_unit_for(
     ``create=True`` lazily builds and registers one (for /hydrate, /learn); otherwise
     returns None when the user has no unit yet (read endpoints then 503). Evicts the
     LRU unit if creating pushes the registry over ``MEMORY_MAX_USERS``.
+
+    When no ``persist_dir`` is given, fall back to ``MEMORY_PERSIST_DIR`` so a
+    container can point storage at a writable path (Cloud Run: ``/tmp``) — the
+    in-package default is not reliably writable there. Unset (local dev) keeps the
+    in-package default. The base is namespaced per-user inside ``MemoryUnit``.
     """
+    if persist_dir is None:
+        persist_dir = os.getenv("MEMORY_PERSIST_DIR") or None
     with _units_lock:
         unit = _memory_units.get(user_id)
         if unit is not None:
