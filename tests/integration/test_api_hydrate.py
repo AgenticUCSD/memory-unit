@@ -1,9 +1,10 @@
 """
 API-level tests for the /hydrate and /refresh endpoints.
 
-These are a regression guard for the api.py <-> core.py signature mismatch that
-made /hydrate and /refresh raise TypeError (api.py called
-MemoryUnit(auth_token=...) and hydrate_from_drive() with the wrong arity).
+Originally a regression guard for the api.py <-> core.py signature mismatch that
+made /hydrate and /refresh raise TypeError. Now also covers per-user routing:
+/hydrate builds/refreshes the *calling user's* own unit and never touches another
+user's (the old single-occupant 403 lockout is gone — see the isolation tests).
 
 They run fully offline: the core MemoryUnit is replaced with a fake, so no
 ChromaDB, no Google Drive, and no OpenAI key are required.
@@ -24,17 +25,21 @@ class FakeMemoryUnit:
 
     last_init_kwargs = None
 
-    def __init__(self, persist_dir=None, model_name="gpt-4o"):
-        # Record kwargs so the test can assert auth_token is NOT passed here.
+    def __init__(self, persist_dir=None, model_name="gpt-4o", user_id=None):
+        # Record kwargs so the test can assert auth_token is NOT passed here and
+        # that user_id IS (per-user namespacing).
         FakeMemoryUnit.last_init_kwargs = {
             "persist_dir": persist_dir,
             "model_name": model_name,
+            "user_id": user_id,
         }
         self.persist_dir = persist_dir
         self.model_name = model_name
+        self.user_id = user_id
         self.auth_token = None
         self.root_folder_id = None
         self.folder_config = None
+        self.documents = []
         self.hydrate_calls = []
 
     def hydrate_from_drive(self, root_folder_id, auth_token, thread_id=None, **_):
@@ -56,13 +61,11 @@ class FakeMemoryUnit:
 
 
 @pytest.fixture(autouse=True)
-def reset_global():
-    """Each test starts with no hydrated memory unit and no owner."""
-    api_module._memory_unit = None
-    api_module._owner_user_id = None
+def reset_registry():
+    """Each test starts with an empty per-user registry."""
+    api_module._memory_units.clear()
     yield
-    api_module._memory_unit = None
-    api_module._owner_user_id = None
+    api_module._memory_units.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -96,16 +99,21 @@ def test_hydrate_succeeds_and_wires_args_correctly(client):
     assert body["status"] == "success"
     assert body["documents_indexed"] == 3
 
-    # The bug was passing auth_token to the constructor — assert we don't.
+    # The bug was passing auth_token to the constructor — assert we don't; and that
+    # the per-user id IS threaded in for namespacing.
     assert "auth_token" not in FakeMemoryUnit.last_init_kwargs
+    assert FakeMemoryUnit.last_init_kwargs["user_id"] == "user-1"
 
     # hydrate_from_drive must receive BOTH the folder id and the token.
-    assert api_module._memory_unit.hydrate_calls == [("root123", "ya29.fake")]
+    assert api_module._memory_units["user-1"].hydrate_calls == [("root123", "ya29.fake")]
 
 
 def test_refresh_before_hydrate_returns_503(client):
-    # No hydration yet -> dependency reports the unit is uninitialized.
-    resp = client.post("/refresh", headers={"Authorization": "Bearer ya29.fake"})
+    # No unit for this user yet -> 503 (uninitialized), even with a valid header.
+    resp = client.post(
+        "/refresh",
+        headers={"Authorization": "Bearer ya29.fake", "X-User-Id": "user-1"},
+    )
     assert resp.status_code == 503
 
 
@@ -124,12 +132,12 @@ def test_refresh_reuses_stored_root_folder(client):
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "refreshed"
     # Refresh re-hydrates the same folder with the new token, no folder id needed.
-    assert api_module._memory_unit.hydrate_calls[-1] == ("root123", "ya29.second")
+    assert api_module._memory_units["user-1"].hydrate_calls[-1] == ("root123", "ya29.second")
 
 
-# ── single-tenant owner guard on /hydrate (takeover prevention) ──
+# ── per-user isolation on /hydrate (the old 403 lockout is replaced) ──
 
-def test_hydrate_by_different_user_is_forbidden(client):
+def test_hydrate_by_different_user_is_isolated(client):
     with patch.object(api_module, "MemoryUnit", FakeMemoryUnit):
         r1 = client.post(
             "/hydrate",
@@ -137,28 +145,33 @@ def test_hydrate_by_different_user_is_forbidden(client):
             headers={"Authorization": "Bearer ya29.a", "X-User-Id": "user-1"},
         )
         assert r1.status_code == 200, r1.text
-        first_unit = api_module._memory_unit
+        first_unit = api_module._memory_units["user-1"]
 
-        # A different valid-token user must NOT be able to take over / wipe the unit.
+        # A different user now gets their OWN unit (no 403 lockout) and does not
+        # touch user-1's data.
         r2 = client.post(
             "/hydrate",
             json={"root_folder_id": "rootZZZ"},
             headers={"Authorization": "Bearer ya29.b", "X-User-Id": "user-2"},
         )
 
-    assert r2.status_code == 403
-    # Incumbent owner + unit are untouched (no takeover, no re-create/wipe).
-    assert api_module._owner_user_id == "user-1"
-    assert api_module._memory_unit is first_unit
+    assert r2.status_code == 200, r2.text
+    # Both users are resident, each with their own distinct unit.
+    assert api_module._memory_units["user-1"] is first_unit  # untouched
+    assert api_module._memory_units["user-2"] is not first_unit
+    # user-1's unit only ever hydrated its own folder.
+    assert first_unit.hydrate_calls == [("root123", "ya29.a")]
+    assert api_module._memory_units["user-2"].hydrate_calls == [("rootZZZ", "ya29.b")]
 
 
-def test_same_user_can_rehydrate(client):
+def test_same_user_rehydrate_reuses_their_unit(client):
     with patch.object(api_module, "MemoryUnit", FakeMemoryUnit):
         r1 = client.post(
             "/hydrate",
             json={"root_folder_id": "root123"},
             headers={"Authorization": "Bearer ya29.a", "X-User-Id": "user-1"},
         )
+        unit = api_module._memory_units["user-1"]
         r2 = client.post(
             "/hydrate",
             json={"root_folder_id": "root123"},
@@ -166,17 +179,18 @@ def test_same_user_can_rehydrate(client):
         )
 
     assert r1.status_code == 200, r1.text
-    assert r2.status_code == 200, r2.text  # the owner may re-hydrate
-    assert api_module._owner_user_id == "user-1"
+    assert r2.status_code == 200, r2.text  # the same user may re-hydrate
+    # Re-hydrate reuses the same unit object and re-runs hydrate on it.
+    assert api_module._memory_units["user-1"] is unit
+    assert unit.hydrate_calls == [("root123", "ya29.a"), ("root123", "ya29.a2")]
 
 
 def test_refresh_with_expired_stored_token_returns_401(client, monkeypatch):
     # A unit hydrated earlier, whose stored token has since expired.
-    unit = FakeMemoryUnit()
+    unit = FakeMemoryUnit(user_id="user-1")
     unit.auth_token = "ya29.stored-expired"
     unit.root_folder_id = "root123"
-    api_module._memory_unit = unit
-    api_module._owner_user_id = "user-1"
+    api_module._memory_units["user-1"] = unit
 
     def expired(token, x_user_id):
         raise HTTPException(status_code=401, detail="Invalid or expired access token")
@@ -189,3 +203,8 @@ def test_refresh_with_expired_stored_token_returns_401(client, monkeypatch):
 
     # The fix: a clean 401 ("re-authenticate"), not a 500 from a failed Drive call.
     assert resp.status_code == 401, resp.text
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v"]))

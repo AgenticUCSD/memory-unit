@@ -40,6 +40,36 @@ def validation_enabled() -> bool:
     )
 
 
+def require_sub_enabled() -> bool:
+    """Strict mode: reject a validated token that carries no ``sub``.
+
+    OFF by default (only meaningful when :func:`validation_enabled`). A Google
+    access token with only API scopes (gmail/calendar, no openid) returns no
+    ``sub``, so the default trusts ``X-User-Id`` for those — matching the
+    executor. But once the store is per-user, an unauthenticated ``X-User-Id``
+    is the way to read another user's data, so enabling this (``MEMORY_REQUIRE_SUB``)
+    binds every request to a real Google identity. Turn on only once callers are
+    known to send an ``openid`` token, or those valid API-scope tokens will 401.
+    """
+    return os.getenv("MEMORY_REQUIRE_SUB", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _check_sub(sub: Optional[str], x_user_id: str) -> None:
+    """Enforce the sub/X-User-Id relationship for a validated token."""
+    if sub and sub != x_user_id:
+        raise HTTPException(status_code=401, detail="User ID does not match token")
+    if require_sub_enabled() and not sub:
+        raise HTTPException(
+            status_code=401,
+            detail="Token has no subject; an openid-scoped token is required",
+        )
+
+
 def _get_cached(token: str):
     """Return a 1-tuple ``(sub,)`` on a live cache hit, else None (a miss)."""
     entry = _TOKEN_CACHE.get(token)
@@ -68,9 +98,7 @@ def verify_google_token(token: str, x_user_id: str) -> None:
 
     cached = _get_cached(token)
     if cached is not None:
-        sub = cached[0]
-        if sub and sub != x_user_id:
-            raise HTTPException(status_code=401, detail="User ID does not match token")
+        _check_sub(cached[0], x_user_id)
         return
 
     url = GOOGLE_TOKENINFO_URL + "?" + urllib.parse.urlencode({"access_token": token})
@@ -96,13 +124,13 @@ def verify_google_token(token: str, x_user_id: str) -> None:
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid token info response")
 
-    # Cross-check `sub` when present. INTENTIONALLY lenient when it is absent: a
-    # Google access token carrying only API scopes (e.g. gmail/calendar, no openid)
-    # does not return `sub` from tokeninfo, and we then trust X-User-Id — matching
-    # the executor's `services/auth.py` on purpose. Do NOT make `sub` mandatory: it
-    # would reject those valid API-scope tokens and diverge from the live reference.
+    # Cross-check `sub` when present. Lenient when absent by default: a Google
+    # access token carrying only API scopes (e.g. gmail/calendar, no openid) does
+    # not return `sub` from tokeninfo, so we then trust X-User-Id — matching the
+    # executor's `services/auth.py`. Set MEMORY_REQUIRE_SUB=on (see require_sub_enabled)
+    # to reject those sub-less tokens once per-user isolation makes an unauthenticated
+    # X-User-Id a cross-user read vector.
     sub = info.get("sub")
-    if sub and sub != x_user_id:
-        raise HTTPException(status_code=401, detail="User ID does not match token")
+    _check_sub(sub, x_user_id)
 
     _set_cached(token, sub)

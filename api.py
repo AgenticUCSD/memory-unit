@@ -13,8 +13,10 @@ Auth token flow (from Chrome extension):
 """
 
 from typing import Optional, Dict, Any, List
+from collections import OrderedDict
 import os
 import logging
+import threading
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +28,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from memory_unit import MemoryUnit, ContextQueryResult, DriveFolderConfig
-from memory_unit.auth import verify_google_token
+from memory_unit.auth import verify_google_token, validation_enabled
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -56,13 +58,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global memory unit instance
-_memory_unit: Optional[MemoryUnit] = None
+# Per-user memory units — one MemoryUnit per user_id, each with its own Chroma
+# collection + BM25 + preferences (namespaced in MemoryUnit.__init__). This is the
+# real multi-tenant isolation: a request routes only to its own user's unit, so
+# there is no shared retrievable state to leak across users (the old single global
+# `_memory_unit` + `_owner_user_id` lockout is replaced by this partitioning).
+# LRU-ordered so we can evict the least-recently-used unit past MEMORY_MAX_USERS.
+_memory_units: "OrderedDict[str, MemoryUnit]" = OrderedDict()
+# Guards every read/mutation of `_memory_units` — sync endpoints run in a threadpool,
+# so the registry is touched concurrently.
+_units_lock = threading.Lock()
 
-# The user_id (Google `sub`) that hydrated the current memory. Until per-user data
-# isolation lands, the unit holds one user's documents at a time, so we refuse to serve
-# a *different* user from the hydrating user's data. Set on /hydrate.
-_owner_user_id: Optional[str] = None
+
+def _max_users() -> int:
+    """Cap on resident per-user units (LRU-evicted past this). Bounds RAM growth."""
+    try:
+        return max(1, int(os.getenv("MEMORY_MAX_USERS", "100")))
+    except ValueError:
+        return 100
+
+
+def _get_unit_for(
+    user_id: str,
+    *,
+    create: bool = False,
+    persist_dir: Optional[str] = None,
+    model_name: str = "gpt-4o",
+) -> Optional[MemoryUnit]:
+    """Return this user's MemoryUnit (marking it most-recently-used).
+
+    ``create=True`` lazily builds and registers one (for /hydrate, /learn); otherwise
+    returns None when the user has no unit yet (read endpoints then 503). Evicts the
+    LRU unit if creating pushes the registry over ``MEMORY_MAX_USERS``.
+    """
+    with _units_lock:
+        unit = _memory_units.get(user_id)
+        if unit is not None:
+            _memory_units.move_to_end(user_id)
+            return unit
+        if not create:
+            return None
+        unit = MemoryUnit(
+            persist_dir=persist_dir, model_name=model_name, user_id=user_id
+        )
+        _memory_units[user_id] = unit
+        while len(_memory_units) > _max_users():
+            evicted_id, _ = _memory_units.popitem(last=False)  # LRU
+            logger.info("Evicted LRU memory unit (cap=%d)", _max_users())
+        return unit
 
 
 # =============================================================================
@@ -176,62 +219,6 @@ class HealthResponse(BaseModel):
 # Dependencies
 # =============================================================================
 
-def get_memory_unit() -> MemoryUnit:
-    """Dependency to get initialized memory unit."""
-    if _memory_unit is None:
-        raise HTTPException(status_code=503, detail="Memory unit not initialized. Call /hydrate first.")
-    return _memory_unit
-
-
-def _ensure_memory_unit() -> MemoryUnit:
-    """Return the global memory unit, lazily creating an empty one if needed.
-
-    Lets write-back (/learn) seed a queryable unit without a Drive hydrate."""
-    global _memory_unit
-    if _memory_unit is None:
-        _memory_unit = MemoryUnit()
-    return _memory_unit
-
-
-def require_owner(x_user_id: Optional[str] = Header(None)) -> str:
-    """Tenancy guard: every data endpoint must carry X-User-Id, and (once the unit has
-    been hydrated) that user must match the user who hydrated it. Prevents serving one
-    user's memory to another while the store is still single-tenant."""
-    if not x_user_id:
-        raise HTTPException(status_code=400, detail="X-User-Id header required")
-    if _owner_user_id is not None and x_user_id != _owner_user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="This memory unit was hydrated for a different user.",
-        )
-    return x_user_id
-
-
-# =============================================================================
-# Health & Status
-# =============================================================================
-
-@app.get("/health", response_model=HealthResponse)
-def health_check():
-    """Health check endpoint."""
-    global _memory_unit
-    return HealthResponse(
-        status="healthy",
-        memory_unit_initialized=_memory_unit is not None,
-        documents_indexed=_memory_unit.vector_store.count() if _memory_unit and _memory_unit.vector_store else 0
-    )
-
-
-@app.get("/stats", response_model=StatsResponse)
-def get_stats(memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends(require_owner)):
-    """Get memory unit statistics."""
-    return StatsResponse(**memory.get_stats())
-
-
-# =============================================================================
-# Hydration
-# =============================================================================
-
 def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
     """Extract token from Authorization: Bearer <token> header."""
     if not authorization:
@@ -241,6 +228,72 @@ def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
     return authorization
 
 
+def authed_user(
+    x_user_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+) -> str:
+    """Authenticate the caller and return their user_id.
+
+    Requires ``X-User-Id`` always; when token validation is enabled
+    (``MEMORY_VALIDATE_TOKEN``, default on) it also requires and verifies the Google
+    bearer. This binds every data request to a real identity BEFORE it can reach that
+    user's isolated store — essential now that routing is per-user (an unauthenticated
+    ``X-User-Id`` would otherwise be a cross-user read vector). No-op bearer check when
+    validation is off (offline/tests)."""
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header required")
+    if validation_enabled():
+        token = extract_bearer_token(authorization)
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail="Authorization header with Bearer token required",
+            )
+        verify_google_token(token, x_user_id)
+    return x_user_id
+
+
+def require_user_unit(user_id: str = Depends(authed_user)) -> MemoryUnit:
+    """Route to the authenticated caller's own MemoryUnit (503 until they /hydrate)."""
+    unit = _get_unit_for(user_id, create=False)
+    if unit is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Memory unit not initialized for this user. Call /hydrate first.",
+        )
+    return unit
+
+
+# =============================================================================
+# Health & Status
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+def health_check():
+    """Health check endpoint. Reports across all resident per-user units.
+
+    Uses the in-RAM document lists (cheap) rather than hitting Chroma per unit, so a
+    frequent liveness probe stays fast."""
+    with _units_lock:
+        units = list(_memory_units.values())
+    total_docs = sum(len(u.documents) for u in units)
+    return HealthResponse(
+        status="healthy",
+        memory_unit_initialized=len(units) > 0,
+        documents_indexed=total_docs,
+    )
+
+
+@app.get("/stats", response_model=StatsResponse)
+def get_stats(memory: MemoryUnit = Depends(require_user_unit)):
+    """Get memory unit statistics for the calling user."""
+    return StatsResponse(**memory.get_stats())
+
+
+# =============================================================================
+# Hydration
+# =============================================================================
+
 @app.post("/hydrate", response_model=HydrateResponse)
 def hydrate_memory(
     request: HydrateRequest,
@@ -249,14 +302,12 @@ def hydrate_memory(
     x_thread_id: Optional[str] = Header(None)
 ):
     """
-    Hydrate the memory unit from Google Drive.
+    Hydrate the calling user's memory unit from Google Drive.
 
     Auth token is passed in Authorization: Bearer <token> header (from extension).
-    This fetches documents from the 2 subfolders and indexes them
-    in the vector store + keyword search database.
+    This fetches documents from the 2 subfolders and indexes them in *this user's*
+    vector store + keyword index — it never touches another user's unit.
     """
-    global _memory_unit, _owner_user_id
-
     auth_token = extract_bearer_token(authorization)
     if not auth_token:
         raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
@@ -264,49 +315,33 @@ def hydrate_memory(
         raise HTTPException(status_code=400, detail="X-User-Id header required")
 
     # Verify the Google token (and that its `sub` matches X-User-Id) before we
-    # trust it to read Drive and bind this unit's owner. 401 on a bad token,
-    # 503 if Google is unreachable.
+    # trust it to read Drive. 401 on a bad token, 503 if Google is unreachable.
     verify_google_token(auth_token, x_user_id)
 
-    # Single-tenant: a *different* user must not take over (or wipe) the unit that
-    # another user already hydrated. Same user may re-hydrate. Checked after auth
-    # (so we don't leak ownership state to an unauthenticated caller) and before we
-    # re-create _memory_unit (so a rejected takeover can't destroy the incumbent's
-    # data). Proper multi-tenant isolation is the deferred pg per-user store.
-    if _owner_user_id is not None and x_user_id != _owner_user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="This memory unit was hydrated for a different user.",
-        )
-
     try:
-        logger.info(f"Initializing memory unit with folder: {request.root_folder_id}")
+        logger.info(f"Hydrating user's memory unit from folder: {request.root_folder_id}")
 
-        # Create or re-initialize memory unit. The ephemeral auth token is NOT a
-        # constructor argument — it is supplied to hydrate_from_drive() at call time.
-        _memory_unit = MemoryUnit(
+        # Get-or-create THIS user's unit (namespaced Chroma collection + learned store).
+        # The ephemeral auth token is NOT a constructor argument — it is supplied to
+        # hydrate_from_drive() at call time. A re-hydrate reuses the existing unit and
+        # rebuilds its store internally; other users' units are untouched.
+        memory = _get_unit_for(
+            x_user_id,
+            create=True,
             persist_dir=request.persist_dir,
-            model_name=request.model_name
+            model_name=request.model_name,
         )
 
-        _memory_unit.folder_config = DriveFolderConfig(
+        memory.folder_config = DriveFolderConfig(
             root_folder_id=request.root_folder_id,
             user_provided_folder_id="",
             machine_generated_folder_id=""
         )
 
-        # Bind the owner so the (shared) pg learned store scopes reads/writes to this
-        # user before the hydrate re-loads learned context; inert for the JSONL store.
-        _memory_unit.user_id = x_user_id
-
         # Hydrate from Drive (root folder id + ephemeral token).
-        result = _memory_unit.hydrate_from_drive(
+        result = memory.hydrate_from_drive(
             request.root_folder_id, auth_token, thread_id=x_thread_id
         )
-
-        # Claim ownership only after a successful hydrate, so a failed hydrate doesn't
-        # lock the unit to a user with no data.
-        _owner_user_id = x_user_id
 
         logger.info(f"Hydrated {result['documents_indexed']} documents")
 
@@ -326,8 +361,7 @@ def hydrate_memory(
 @app.post("/query", response_model=ContextResponse)
 def query_memory(
     request: QueryRequest,
-    memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner),
+    memory: MemoryUnit = Depends(require_user_unit),
     x_thread_id: Optional[str] = Header(None),
 ):
     """
@@ -356,8 +390,7 @@ def query_memory(
 @app.post("/resolve", response_model=ResolveResponse)
 def resolve_slots(
     request: ResolveRequest,
-    x_user_id: str = Depends(require_owner),
-    memory: MemoryUnit = Depends(get_memory_unit),
+    memory: MemoryUnit = Depends(require_user_unit),
     x_thread_id: Optional[str] = Header(None),
 ):
     """Resolve task parameter slots to concrete values (structured field->value).
@@ -365,12 +398,13 @@ def resolve_slots(
     This is the parameter-resolution surface the planner calls to pre-fill task
     slots from user context before falling back to HITL. Unlike /query it returns
     typed slots with source + confidence, not prose. Unresolved fields come back
-    with status="missing" so the caller knows to ask the human.
+    with status="missing" so the caller knows to ask the human. Retrieval is scoped
+    to the calling user's own unit (`memory` is theirs).
     """
     try:
         results = memory.resolve(
             request.fields,
-            user_id=x_user_id,
+            user_id=memory.user_id,
             scope=request.scope,
             min_score=request.min_score,
             thread_id=x_thread_id,
@@ -385,33 +419,31 @@ def resolve_slots(
 def learn_context(
     request: LearnRequest,
     authorization: Optional[str] = Header(None),
-    x_user_id: str = Depends(require_owner),
+    x_user_id: Optional[str] = Header(None),
     x_thread_id: Optional[str] = Header(None),
 ):
     """Write-back: ingest distilled context learned from completed tasks so future
     resolve()/query() calls benefit. In-repo self-learning; durable Drive
     persistence is a follow-up (extension-owned).
 
-    /learn lazily initializes the unit and (if not yet hydrated) claims ownership
-    for the first writer — so a unit can be seeded via write-back without a Drive
-    hydrate. Because it writes and can claim ownership, it authenticates the Google
-    token just like /hydrate (verification is a no-op when MEMORY_VALIDATE_TOKEN is
-    off, but a bearer token is still required)."""
-    global _owner_user_id
+    /learn lazily creates the *calling user's* unit — so a unit can be seeded via
+    write-back without a Drive hydrate. Because it writes, it authenticates the
+    Google token just like /hydrate (verification is a no-op when MEMORY_VALIDATE_TOKEN
+    is off, but a bearer token is still required)."""
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header required")
 
-    # Authenticate before creating the unit or binding ownership (401/503 here
-    # must not be swallowed by the 500 handler below).
+    # Authenticate before creating the unit (401/503 here must not be swallowed by
+    # the 500 handler below).
     auth_token = extract_bearer_token(authorization)
     if not auth_token:
         raise HTTPException(status_code=401, detail="Authorization header with Bearer token required")
     verify_google_token(auth_token, x_user_id)
 
     try:
-        memory = _ensure_memory_unit()
-        if _owner_user_id is None:
-            _owner_user_id = x_user_id
-        # Scope this write to the owner in the shared pg store (inert for JSONL).
-        memory.user_id = x_user_id
+        # Get-or-create this user's own unit; user_id is bound in the constructor and
+        # scopes the write in the shared pg store (inert for JSONL).
+        memory = _get_unit_for(x_user_id, create=True)
         count = memory.learn(
             [item.model_dump() for item in request.items], thread_id=x_thread_id
         )
@@ -427,8 +459,7 @@ def learn_context(
 def vector_search(
     query: str,
     n_results: int = 5,
-    memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner)
+    memory: MemoryUnit = Depends(require_user_unit)
 ):
     """Direct vector search (semantic similarity)."""
     try:
@@ -456,8 +487,7 @@ def vector_search(
 def keyword_search(
     query: str,
     top_k: int = 5,
-    memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner)
+    memory: MemoryUnit = Depends(require_user_unit)
 ):
     """Direct keyword search (BM25)."""
     try:
@@ -477,8 +507,7 @@ def keyword_search(
 @app.post("/context/extension")
 def get_extension_context(
     request: ExtensionContextRequest,
-    memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner)
+    memory: MemoryUnit = Depends(require_user_unit)
 ):
     """
     Get additional context for Extension component.
@@ -499,8 +528,7 @@ def get_extension_context(
 @app.post("/context/task-identifier")
 def get_task_identifier_context(
     request: TaskIdentifierContextRequest,
-    memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner)
+    memory: MemoryUnit = Depends(require_user_unit)
 ):
     """
     Get additional context for Task Identifier component.
@@ -521,8 +549,7 @@ def get_task_identifier_context(
 @app.post("/context/workflow-builder")
 def get_workflow_builder_context(
     request: WorkflowBuilderContextRequest,
-    memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner)
+    memory: MemoryUnit = Depends(require_user_unit)
 ):
     """
     Get additional context for Workflow Builder component.
@@ -543,8 +570,7 @@ def get_workflow_builder_context(
 @app.get("/preferences", response_model=PreferencesResponse)
 def get_preferences(
     category: Optional[str] = None,
-    memory: MemoryUnit = Depends(get_memory_unit),
-    _: str = Depends(require_owner)
+    memory: MemoryUnit = Depends(require_user_unit)
 ):
     """
     Get raw machine-generated preferences by category.
@@ -570,8 +596,8 @@ def get_preferences(
 # =============================================================================
 
 @app.post("/clear")
-def clear_memory(memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends(require_owner)):
-    """Clear all indexed documents."""
+def clear_memory(memory: MemoryUnit = Depends(require_user_unit)):
+    """Clear the calling user's indexed documents."""
     try:
         memory.clear()
         return {"status": "cleared", "message": "All documents removed from memory"}
@@ -582,11 +608,20 @@ def clear_memory(memory: MemoryUnit = Depends(get_memory_unit), _: str = Depends
 @app.post("/refresh")
 def refresh_memory(
     authorization: Optional[str] = Header(None),
-    memory: MemoryUnit = Depends(get_memory_unit),
-    x_user_id: str = Depends(require_owner),
+    x_user_id: Optional[str] = Header(None),
     x_thread_id: Optional[str] = Header(None),
 ):
-    """Refresh memory by re-hydrating from Drive."""
+    """Refresh the calling user's memory by re-hydrating from Drive."""
+    # Routed manually (not via require_user_unit): /refresh may fall back to the token
+    # captured at hydrate, so it can't require a fresh bearer up front.
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header required")
+    memory = _get_unit_for(x_user_id, create=False)
+    if memory is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Memory unit not initialized for this user. Call /hydrate first.",
+        )
     try:
         # Use a freshly-supplied token if present, else fall back to the one captured
         # at hydrate. Verify whichever we're about to use: the stored token may have

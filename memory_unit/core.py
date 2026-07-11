@@ -51,6 +51,25 @@ def resolve_llm_enabled() -> bool:
 _UNSET = object()
 
 
+def _namespace(user_id: Optional[str]) -> str:
+    """A collection/filesystem-safe namespace derived from a user id.
+
+    Used to give each user their own Chroma collection + on-disk dir so per-user
+    ``MemoryUnit`` instances never share retrievable state — isolation by
+    construction. A pure-alphanumeric id (e.g. a numeric Google ``sub``) is kept
+    verbatim for readability; anything else falls back to a deterministic hash so
+    the result is always a valid Chroma name (``[A-Za-z0-9._-]``, 3-63 chars,
+    alphanumeric start/end) and collision-free (distinct ids never collide).
+    Returns ``""`` for a falsy user id (the legacy single shared default).
+    """
+    if not user_id:
+        return ""
+    s = str(user_id)
+    if re.fullmatch(r"[A-Za-z0-9]{3,40}", s):
+        return s
+    return "u" + hashlib.sha1(s.encode("utf-8")).hexdigest()[:20]
+
+
 class MemoryUnit:
     """
     Agentic RAG Memory Unit.
@@ -75,24 +94,38 @@ class MemoryUnit:
     def __init__(
         self,
         persist_dir: Optional[str] = None,
-        model_name: str = "gpt-4o"
+        model_name: str = "gpt-4o",
+        user_id: Optional[str] = None
     ):
         self.auth_token: Optional[str] = None
         self.root_folder_id: Optional[str] = None
-        self.persist_dir = persist_dir
         self.model_name = model_name
-        # Bound owner (Google sub); set by the API on hydrate/learn. Used only to scope
-        # the shared pg learned store; the default per-instance JSONL store ignores it.
-        self.user_id: Optional[str] = None
+        # Bound owner (Google sub). Scopes the shared pg learned store AND namespaces
+        # this instance's own Chroma collection + on-disk dir, so per-user instances
+        # (the API holds one MemoryUnit per user) never share retrievable state.
+        self.user_id: Optional[str] = user_id
+
+        # Per-user namespace. When a base persist_dir is given, isolate on disk per
+        # user (Chroma dir + learned JSONL); when None (in-memory default), the
+        # per-user *collection name* alone keeps users apart in the shared default dir.
+        ns = _namespace(user_id)
+        if persist_dir and ns:
+            persist_dir = os.path.join(persist_dir, ns)
+        self.persist_dir = persist_dir
+
         # Durable store for write-back ("learned") context, re-applied on hydrate.
-        # Backend chosen by STORE_BACKEND (default: per-instance JSONL in persist_dir).
+        # Backend chosen by STORE_BACKEND (default: per-instance JSONL in persist_dir;
+        # now per-user via the namespaced dir. The pg backend scopes by user_id itself).
         self._learned_path = (
             os.path.join(persist_dir, "learned_context.jsonl") if persist_dir else None
         )
         self._learned_store = make_learned_store(persist_dir)
 
         # Initialize persistent components that don't need auth
-        self.vector_store = VectorStore(persist_dir=persist_dir)
+        collection_name = f"memory_documents_{ns}" if ns else "memory_documents"
+        self.vector_store = VectorStore(
+            collection_name=collection_name, persist_dir=persist_dir
+        )
         self.keyword_searcher = BM25Searcher()
         self.memory_tools = MemoryTools(self.vector_store, self.keyword_searcher)
 
@@ -952,7 +985,8 @@ class MemoryUnit:
 
 def create_memory_unit(
     persist_dir: Optional[str] = None,
-    model_name: str = "gpt-4o"
+    model_name: str = "gpt-4o",
+    user_id: Optional[str] = None
 ) -> MemoryUnit:
     """
     Factory function to create a MemoryUnit ready for hydration.
@@ -969,5 +1003,6 @@ def create_memory_unit(
     """
     return MemoryUnit(
         persist_dir=persist_dir,
-        model_name=model_name
+        model_name=model_name,
+        user_id=user_id
     )

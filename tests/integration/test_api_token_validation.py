@@ -16,10 +16,12 @@ from api import app
 
 
 class FakeMemoryUnit:
-    def __init__(self, persist_dir=None, model_name="gpt-4o"):
+    def __init__(self, persist_dir=None, model_name="gpt-4o", user_id=None):
+        self.user_id = user_id
         self.auth_token = None
         self.root_folder_id = None
         self.folder_config = None
+        self.documents = []
 
     def hydrate_from_drive(self, root_folder_id, auth_token, thread_id=None, **_):
         return {
@@ -31,12 +33,10 @@ class FakeMemoryUnit:
 
 
 @pytest.fixture(autouse=True)
-def reset_global():
-    api_module._memory_unit = None
-    api_module._owner_user_id = None
+def reset_registry():
+    api_module._memory_units.clear()
     yield
-    api_module._memory_unit = None
-    api_module._owner_user_id = None
+    api_module._memory_units.clear()
 
 
 @pytest.fixture
@@ -58,8 +58,8 @@ def test_hydrate_rejects_invalid_token(client, monkeypatch):
         )
 
     assert resp.status_code == 401
-    # A rejected token must not bind ownership.
-    assert api_module._owner_user_id is None
+    # A rejected token must not create a unit for that user.
+    assert "user-1" not in api_module._memory_units
 
 
 def test_hydrate_accepts_valid_token(client, monkeypatch):
@@ -73,7 +73,7 @@ def test_hydrate_accepts_valid_token(client, monkeypatch):
         )
 
     assert resp.status_code == 200, resp.text
-    assert api_module._owner_user_id == "user-1"
+    assert "user-1" in api_module._memory_units
 
 
 if __name__ == "__main__":
