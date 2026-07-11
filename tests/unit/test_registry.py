@@ -82,6 +82,26 @@ def test_access_marks_most_recently_used(monkeypatch):
     assert "b" not in api_module._memory_units
 
 
+def test_persist_dir_falls_back_to_env(monkeypatch):
+    # Containers set MEMORY_PERSIST_DIR to a writable path (Cloud Run: /tmp); a unit
+    # created without an explicit persist_dir must pick it up.
+    monkeypatch.setenv("MEMORY_PERSIST_DIR", "/tmp/memory_data")
+    unit = api_module._get_unit_for("u1", create=True)
+    assert unit.persist_dir == "/tmp/memory_data"
+
+
+def test_explicit_persist_dir_wins_over_env(monkeypatch):
+    monkeypatch.setenv("MEMORY_PERSIST_DIR", "/tmp/memory_data")
+    unit = api_module._get_unit_for("u1", create=True, persist_dir="/data/explicit")
+    assert unit.persist_dir == "/data/explicit"
+
+
+def test_no_persist_dir_when_env_unset(monkeypatch):
+    monkeypatch.delenv("MEMORY_PERSIST_DIR", raising=False)
+    unit = api_module._get_unit_for("u1", create=True)
+    assert unit.persist_dir is None  # in-package default used downstream
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

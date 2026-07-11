@@ -1,0 +1,33 @@
+# Keep the build context small and reproducible. Critically, exclude the local venv
+# (py3.14) so it never leaks into the py3.11 image, and never ship secrets.
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs (repo venv is py3.14 — must NOT enter the 3.11 image)
+venv/
+.venv/
+env/
+
+# Local state / secrets — never build these in
+.env
+.env.*
+!.env.example
+chroma_data/
+memory_unit/chroma_data/
+*.jsonl
+
+# Tests + docs aren't needed at runtime
+tests/
+README.md
+DRIVE_CONNECTION.md
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
