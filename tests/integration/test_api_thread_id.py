@@ -5,6 +5,10 @@ forwards it on /resolve for trace correlation. These tests confirm it is now
 threaded into resolve()/query() (fully offline via a recording fake).
 """
 
+import os
+
+os.environ["MEMORY_VALIDATE_TOKEN"] = "false"
+
 import pytest
 from types import SimpleNamespace
 from fastapi.testclient import TestClient
@@ -14,7 +18,9 @@ from api import app
 
 
 class RecordingMemoryUnit:
-    def __init__(self):
+    def __init__(self, user_id="user-1"):
+        self.user_id = user_id
+        self.documents = []
         self.seen = {}
 
     def resolve(self, fields, user_id=None, scope=None, min_score=0.0, thread_id=None, **_):
@@ -39,12 +45,10 @@ class RecordingMemoryUnit:
 
 
 @pytest.fixture(autouse=True)
-def reset_global():
-    api_module._memory_unit = None
-    api_module._owner_user_id = None
+def reset_registry():
+    api_module._memory_units.clear()
     yield
-    api_module._memory_unit = None
-    api_module._owner_user_id = None
+    api_module._memory_units.clear()
 
 
 @pytest.fixture
@@ -54,9 +58,8 @@ def client():
 
 @pytest.fixture
 def fake():
-    unit = RecordingMemoryUnit()
-    api_module._memory_unit = unit
-    api_module._owner_user_id = "user-1"
+    unit = RecordingMemoryUnit(user_id="user-1")
+    api_module._memory_units["user-1"] = unit
     return unit
 
 

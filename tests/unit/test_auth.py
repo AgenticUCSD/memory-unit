@@ -101,3 +101,50 @@ def test_cache_avoids_second_network_call(monkeypatch):
     auth.verify_google_token("tok", "user-1")
     auth.verify_google_token("tok", "user-1")
     assert calls["n"] == 1  # second call served from cache
+
+
+# ── MEMORY_REQUIRE_SUB (strict-sub) flag ───────────────────────────
+
+def _subless(url, timeout=None):
+    # An API-scope token (gmail/calendar, no openid) returns no `sub`.
+    return _FakeResp(200, '{"email": "a@b.com"}')
+
+
+def test_subless_token_passes_by_default(monkeypatch):
+    # Default (flag off) is lenient — matches the executor and valid API-scope tokens.
+    monkeypatch.setenv("MEMORY_VALIDATE_TOKEN", "true")
+    monkeypatch.delenv("MEMORY_REQUIRE_SUB", raising=False)
+    monkeypatch.setattr(auth.urllib.request, "urlopen", _subless)
+    auth.verify_google_token("tok", "user-1")  # no raise
+
+
+def test_subless_token_rejected_when_require_sub(monkeypatch):
+    monkeypatch.setenv("MEMORY_VALIDATE_TOKEN", "true")
+    monkeypatch.setenv("MEMORY_REQUIRE_SUB", "true")
+    monkeypatch.setattr(auth.urllib.request, "urlopen", _subless)
+    with pytest.raises(HTTPException) as ei:
+        auth.verify_google_token("tok", "user-1")
+    assert ei.value.status_code == 401
+
+
+def test_sub_token_still_passes_when_require_sub(monkeypatch):
+    monkeypatch.setenv("MEMORY_VALIDATE_TOKEN", "true")
+    monkeypatch.setenv("MEMORY_REQUIRE_SUB", "true")
+    monkeypatch.setattr(
+        auth.urllib.request,
+        "urlopen",
+        lambda url, timeout=None: _FakeResp(200, '{"sub": "user-1"}'),
+    )
+    auth.verify_google_token("tok", "user-1")  # no raise
+
+
+def test_require_sub_enforced_on_cached_path(monkeypatch):
+    # A sub-less token cached while lenient must still be rejected once strict mode
+    # flips on (the cache stores sub=None and _check_sub re-evaluates the flag).
+    monkeypatch.setenv("MEMORY_VALIDATE_TOKEN", "true")
+    monkeypatch.setattr(auth.urllib.request, "urlopen", _subless)
+    auth.verify_google_token("tok", "user-1")  # caches sub=None (lenient)
+    monkeypatch.setenv("MEMORY_REQUIRE_SUB", "true")
+    with pytest.raises(HTTPException) as ei:
+        auth.verify_google_token("tok", "user-1")  # cache hit, now strict
+    assert ei.value.status_code == 401
