@@ -191,3 +191,119 @@ def test_extract_value_llm_empty_text_is_none():
     mu = _bare_unit()
     mu._extractor_llm = _FakeLLM(content="should-not-matter")
     assert mu._extract_value_llm("recipient", "   ") is None
+
+
+# ── relevance floor (MEMORY_RESOLVE_MIN_COVERAGE) ────────────────────────────
+#
+# Regression cover for the fabrication bug: without a floor, evidence *selection*
+# always succeeds -- BM25 accepts a doc sharing one token, and the vector fallback
+# returns its nearest neighbour unconditionally -- so an absent slot came back
+# status="present" with a value sliced out of an unrelated snippet. Calibration on
+# a live corpus measured 36/36 absent slots fabricated before this floor.
+
+
+def _phone_unit(tmp_path):
+    """A store that knows a phone number and nothing about flights."""
+    mu = MemoryUnit(persist_dir=str(tmp_path))
+    mu.keyword_searcher.index_documents(
+        ["My phone number is 555-0142."], [{"filename": "prefs.txt"}]
+    )
+    mu.is_hydrated = True
+    return mu
+
+
+def test_partial_token_match_is_missing(tmp_path, monkeypatch):
+    # "flight number" shares only the generic token "number" with the phone doc.
+    monkeypatch.delenv("MEMORY_RESOLVE_MIN_COVERAGE", raising=False)
+    mu = _phone_unit(tmp_path)
+    slot = mu.resolve(["flight_number"])[0]
+    assert slot["status"] == "missing"
+    assert slot["value"] is None
+
+
+def test_full_token_match_still_resolves(tmp_path, monkeypatch):
+    # The true positive on the same store must survive the floor.
+    monkeypatch.delenv("MEMORY_RESOLVE_MIN_COVERAGE", raising=False)
+    mu = _phone_unit(tmp_path)
+    slot = mu.resolve(["phone_number"])[0]
+    assert slot["status"] == "present"
+    # Asserting on the evidence, not the extracted value: _extract_value's number
+    # regex stops at the hyphen and yields "555" for "555-0142". That is a
+    # pre-existing extraction wart, independent of the relevance floor this covers.
+    assert "555-0142" in slot["evidence"]
+
+
+def test_zero_coverage_restores_old_behaviour(tmp_path):
+    # The escape hatch: 0.0 accepts any scoring hit, i.e. pre-floor behaviour.
+    mu = _phone_unit(tmp_path)
+    slot = mu.resolve(["flight_number"], min_coverage=0.0)[0]
+    assert slot["status"] == "present"
+
+
+def test_env_var_sets_the_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "0.0")
+    mu = _phone_unit(tmp_path)
+    assert mu.resolve(["flight_number"])[0]["status"] == "present"
+    monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "1.0")
+    assert mu.resolve(["flight_number"])[0]["status"] == "missing"
+
+
+def test_explicit_arg_overrides_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "1.0")
+    mu = _phone_unit(tmp_path)
+    assert mu.resolve(["flight_number"], min_coverage=0.0)[0]["status"] == "present"
+
+
+def test_vector_fallback_is_gated_by_the_floor(tmp_path, monkeypatch):
+    # The vector branch has no BM25 gate at all: a nearest neighbour always exists,
+    # and measured distances do not separate present from absent. Stub it to return
+    # an unrelated doc and assert the floor -- not the distance -- rejects it.
+    monkeypatch.delenv("MEMORY_RESOLVE_MIN_COVERAGE", raising=False)
+    mu = MemoryUnit(persist_dir=str(tmp_path))
+    mu.is_hydrated = True
+    monkeypatch.setattr(
+        mu.vector_store,
+        "query",
+        lambda query_text, n_results=5, filter_dict=None: {
+            "documents": [["My timezone is America/Los_Angeles."]],
+            "distances": [[0.82]],
+        },
+    )
+    assert mu.resolve(["blood_type"])[0]["status"] == "missing"
+    # ...and the same stub still serves a slot it genuinely covers.
+    assert mu.resolve(["timezone"])[0]["status"] == "present"
+
+
+def test_covering_hit_wins_over_higher_scoring_partial(tmp_path, monkeypatch):
+    # The floor made top_k=1 unsafe: the top-scoring hit can be a partial match
+    # while a lower-scoring one covers the whole slot name. The covering one wins.
+    monkeypatch.delenv("MEMORY_RESOLVE_MIN_COVERAGE", raising=False)
+    mu = MemoryUnit(persist_dir=str(tmp_path))
+    mu.keyword_searcher.index_documents(
+        [
+            "number number number number number number number.",
+            "The flight number is UA482.",
+        ],
+        [{"filename": "noise.txt"}, {"filename": "trip.txt"}],
+    )
+    mu.is_hydrated = True
+    slot = mu.resolve(["flight_number"])[0]
+    assert slot["status"] == "present"
+    assert "UA482" in slot["value"]
+
+
+def test_resolve_min_coverage_parsing(monkeypatch):
+    from memory_unit.core import resolve_min_coverage
+
+    monkeypatch.delenv("MEMORY_RESOLVE_MIN_COVERAGE", raising=False)
+    assert resolve_min_coverage() == 1.0          # safe default
+    monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "0.5")
+    assert resolve_min_coverage() == 0.5
+    monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "  0.75 ")
+    assert resolve_min_coverage() == 0.75
+    monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "banana")
+    assert resolve_min_coverage() == 1.0          # unparseable -> safe default
+    monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "5")
+    assert resolve_min_coverage() == 1.0          # clamped
+    monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "-2")
+    assert resolve_min_coverage() == 0.0          # clamped

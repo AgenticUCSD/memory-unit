@@ -156,6 +156,16 @@ class ResolveRequest(BaseModel):
         None, description="Ordered preferred scopes, most-specific first (e.g. [user, org, global])"
     )
     min_score: float = Field(0.0, description="Minimum BM25 score before a field counts as resolved")
+    min_coverage: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of the slot name's tokens that must literally appear in the "
+            "evidence before it counts as resolved. Omit to use the server default "
+            "(MEMORY_RESOLVE_MIN_COVERAGE, itself 1.0); 0.0 accepts any hit."
+        ),
+    )
 
 
 class ResolvedSlot(BaseModel):
@@ -415,6 +425,7 @@ def resolve_slots(
             scope=request.scope,
             min_score=request.min_score,
             thread_id=x_thread_id,
+            min_coverage=request.min_coverage,
         )
         return ResolveResponse(slots=[ResolvedSlot(**r) for r in results])
     except Exception as e:
