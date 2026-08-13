@@ -60,10 +60,17 @@ class VectorStore:
         ]
         ids = [doc.doc_id for doc in documents]
 
-        # Batch add
+        # Batch upsert, not add. The collection is a PersistentClient on disk while a
+        # MemoryUnit is a per-process object, so the same document can legitimately be
+        # re-indexed by a *new* unit built over an existing directory (read-path lazy
+        # creation after an LRU eviction). Documents carrying a deterministic doc_id —
+        # learned/write-back blocks, keyed by content hash — must overwrite in place
+        # rather than accumulate a duplicate copy per rebuild; on Cloud Run persist_dir
+        # is memory-backed /tmp, so that growth would be charged against instance RAM.
+        # For uuid4-keyed docs (the Drive corpus) upsert behaves exactly like add.
         batch_size = 100
         for i in range(0, len(documents), batch_size):
-            self.collection.add(
+            self.collection.upsert(
                 documents=texts[i:i + batch_size],
                 metadatas=metadatas[i:i + batch_size],
                 ids=ids[i:i + batch_size]
