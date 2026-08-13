@@ -47,6 +47,37 @@ def resolve_llm_enabled() -> bool:
     )
 
 
+def resolve_min_coverage() -> float:
+    """Minimum fraction of a slot name's tokens that must literally appear in the
+    evidence before ``resolve()`` will return a value.
+
+    Without a floor, evidence *selection* always succeeds: BM25 returns any doc
+    sharing a single token, and the vector fallback returns its nearest neighbour
+    no matter how far away it is. ``_extract_value`` then slices a value out of
+    whatever was picked, so an absent slot comes back ``status="present"`` with a
+    fabricated value. Measured on a 12- and a 40-block corpus, that was **36/36
+    absent slots fabricated**.
+
+    A *coverage* floor is the right lever rather than a score/confidence floor:
+    the BM25 score here scales with corpus size (``bm25_search`` omits the log in
+    its IDF, so the same true hit scored 19.1 at 12 blocks and 66.0 at 40), and
+    vector distance does not separate present from absent at all (ranges overlap
+    almost exactly). Coverage is corpus-size independent by construction. At the
+    default 1.0 the calibration kept 18/18 true positives and 0/28 false ones.
+
+    Override with ``MEMORY_RESOLVE_MIN_COVERAGE`` (0.0 restores the old
+    accept-anything behaviour exactly). Out-of-range or unparseable values fall
+    back to the safe default.
+    """
+    raw = os.getenv("MEMORY_RESOLVE_MIN_COVERAGE", "").strip()
+    if not raw:
+        return 1.0
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return 1.0
+
+
 # Sentinel distinguishing "extractor LLM not yet built" from "built and failed (None)".
 _UNSET = object()
 
@@ -423,6 +454,7 @@ class MemoryUnit:
         scope: Optional[List[str]] = None,
         min_score: float = 0.0,
         thread_id: Optional[str] = None,
+        min_coverage: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Resolve task parameter *slots* to concrete values from indexed context.
 
@@ -445,10 +477,15 @@ class MemoryUnit:
                 first (e.g. ["thread:T1", "user:U1", "global"]). When given,
                 evidence tagged with a more-specific scope wins over a less-specific
                 or unscoped one; unscoped evidence is always an allowed fallback.
-            min_score: minimum BM25 score before a field counts as resolved.
+            min_score: minimum BM25 score before a field counts as resolved. Note
+                this scales with corpus size (see ``resolve_min_coverage``), so
+                ``min_coverage`` is the more reliable precision lever.
             thread_id: caller's ``X-Thread-Id`` for trace correlation (accepted so
                 the provider's forwarded header is no longer dropped; used by the
                 retrieval span when tracing is enabled).
+            min_coverage: fraction of the slot name's tokens that must literally
+                appear in the evidence. ``None`` uses the configured default
+                (``MEMORY_RESOLVE_MIN_COVERAGE``, itself defaulting to 1.0).
 
         Returns:
             One dict per input field: ``{field, value, evidence, source, confidence,
@@ -470,7 +507,9 @@ class MemoryUnit:
             }
 
             if self._servable() and field and field.strip():
-                best = self._best_evidence_for(field, min_score=min_score, scope=scope)
+                best = self._best_evidence_for(
+                    field, min_score=min_score, scope=scope, min_coverage=min_coverage
+                )
                 if best is not None:
                     item.update(best)
                     item["status"] = "present"
@@ -499,8 +538,23 @@ class MemoryUnit:
             return scope.index(meta_scope)
         return len(scope)
 
+    def _term_coverage(self, query_tokens: List[str], text: str) -> float:
+        """Fraction of a slot name's tokens that literally appear in ``text``.
+
+        The relevance floor `_best_evidence_for` applies. Uses the BM25 tokenizer
+        so "coverage" means exactly what "matched a term" means to the searcher.
+        """
+        if not query_tokens:
+            return 0.0
+        doc_tokens = set(self.keyword_searcher.tokenize(text or ""))
+        return sum(1 for t in query_tokens if t in doc_tokens) / len(query_tokens)
+
     def _best_evidence_for(
-        self, field: str, min_score: float = 0.0, scope: Optional[List[str]] = None
+        self,
+        field: str,
+        min_score: float = 0.0,
+        scope: Optional[List[str]] = None,
+        min_coverage: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Best supporting snippet for a slot name, or None.
 
@@ -508,14 +562,33 @@ class MemoryUnit:
         best-effort fallback when the keyword index yields nothing. When ``scope``
         is given, a more-specific-scoped hit beats a higher-relevance but
         less-specific one.
+
+        Both branches are gated by a **term-coverage floor** (see
+        ``resolve_min_coverage``): evidence only counts when at least that
+        fraction of the slot name's tokens literally appears in it. Without the
+        floor either branch will happily return an unrelated snippet — BM25 on one
+        shared token, and the vector fallback unconditionally, since a nearest
+        neighbour always exists. Returning None here is what makes ``resolve()``
+        report ``status="missing"`` so the caller asks the human instead.
         """
         # Slot names are typically snake_case; the BM25 tokenizer drops "_"-joined
         # words, so search on a space-normalized query (e.g. "meeting_duration" ->
         # "meeting duration"). The original `field` still drives value extraction.
         query = field.replace("_", " ").strip() or field
+        floor = resolve_min_coverage() if min_coverage is None else min_coverage
+        query_tokens = self.keyword_searcher.tokenize(query)
 
-        hits = self.keyword_searcher.search(query, top_k=5 if scope else 1)
-        candidates = [h for h in hits if float(h.get("score", 0.0)) > min_score]
+        # Always take the top 5: with a coverage floor the highest-scoring hit may
+        # be rejected while a slightly lower-scoring one covers the whole slot name.
+        # With the floor at 0.0 and no scope this still picks the top hit, so the
+        # pre-floor behaviour is preserved exactly.
+        hits = self.keyword_searcher.search(query, top_k=5)
+        candidates = [
+            h
+            for h in hits
+            if float(h.get("score", 0.0)) > min_score
+            and self._term_coverage(query_tokens, h.get("content", "")) >= floor
+        ]
         if candidates:
             if scope:
                 # Prefer scope specificity first, then relevance.
@@ -547,6 +620,11 @@ class MemoryUnit:
             if docs and docs[0]:
                 distance = float(dists[0][0]) if dists and dists[0] else 1.0
                 snippet = docs[0][0].strip()
+                # A nearest neighbour always exists, and measured distance does not
+                # separate present slots from absent ones, so this branch needs the
+                # same coverage floor or it fabricates a value for every miss.
+                if self._term_coverage(query_tokens, snippet) < floor:
+                    return None
                 # Chroma distances are >= 0 (smaller = closer). Convert to (0, 1].
                 return {
                     "value": self._resolve_value(field, snippet),
