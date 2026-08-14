@@ -16,6 +16,24 @@ class _Stub:
         self.persist_dir = persist_dir
 
 
+class _ReloadRecordingStub(_Stub):
+    """Tracks how many times `_reload_learned` is invoked on this instance."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.reload_calls = 0
+
+    def _reload_learned(self):
+        self.reload_calls += 1
+
+
+class _ReloadRaisingStub(_Stub):
+    """Simulates a learned-store read failure (e.g. a Postgres blip) at reload."""
+
+    def _reload_learned(self):
+        raise RuntimeError("learned store unreachable")
+
+
 @pytest.fixture(autouse=True)
 def reset_registry(monkeypatch):
     monkeypatch.setattr(api_module, "MemoryUnit", _Stub)
@@ -57,6 +75,30 @@ def test_create_registers_and_binds_user_id():
     assert api_module._memory_units["u1"] is unit
     # Idempotent: same user returns the same instance (no duplicate build).
     assert api_module._get_unit_for("u1", create=True) is unit
+
+
+def test_create_reloads_learned_context_exactly_once(monkeypatch):
+    # A fresh unit's durable learned blocks must be re-ingested right away (so
+    # require_user_unit's callers can resolve() from them with no /hydrate) — but
+    # exactly once per construction, not once per _get_unit_for() call.
+    monkeypatch.setattr(api_module, "MemoryUnit", _ReloadRecordingStub)
+    unit = api_module._get_unit_for("u1", create=True)
+    assert unit.reload_calls == 1
+    # Cache hits (unit already resident) must not trigger another reload.
+    same = api_module._get_unit_for("u1", create=True)
+    assert same is unit
+    assert unit.reload_calls == 1
+    api_module._get_unit_for("u1", create=False)
+    assert unit.reload_calls == 1
+
+
+def test_create_survives_learned_store_failure(monkeypatch):
+    # A learned-store read failure at creation time must degrade to an empty (but
+    # registered and usable) unit, never propagate out of _get_unit_for.
+    monkeypatch.setattr(api_module, "MemoryUnit", _ReloadRaisingStub)
+    unit = api_module._get_unit_for("u1", create=True)
+    assert unit is not None
+    assert api_module._memory_units["u1"] is unit
 
 
 def test_lru_eviction_past_cap(monkeypatch):

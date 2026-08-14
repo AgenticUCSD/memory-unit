@@ -80,22 +80,29 @@ def test_query_without_user_id_is_rejected(client):
     assert resp.status_code == 400
 
 
-def test_query_for_user_without_a_unit_is_503(client):
-    # A user who has not hydrated has no unit yet -> 503 (not 403; there is no
-    # cross-user lockout anymore).
+def test_query_for_user_without_a_unit_lazily_creates_one(client):
+    # A user who has not hydrated has no unit yet -> the dependency now lazily
+    # creates a real (empty) one instead of 503ing (not 403 either; there is no
+    # cross-user lockout). An un-hydrated real unit answers with its canned
+    # not-yet-hydrated message rather than erroring.
     _register("user-1")
     resp = client.post(
         "/query", json={"query": "hi"}, headers={"X-User-Id": "user-2"}
     )
-    assert resp.status_code == 503
+    assert resp.status_code == 200, resp.text
+    assert "not yet hydrated" in resp.json()["answer"]
+    assert "user-2" in api_module._memory_units
+    assert api_module._memory_units["user-2"] is not api_module._memory_units["user-1"]
 
 
 def test_query_routes_to_callers_own_unit(client):
     resp = client.post(
         "/query", json={"query": "hi"}, headers={"X-User-Id": "user-1"}
     )
-    # 503 before hydrate...
-    assert resp.status_code == 503
+    # No unit yet before hydrate -> lazily created real unit, not yet hydrated...
+    assert resp.status_code == 200, resp.text
+    assert "not yet hydrated" in resp.json()["answer"]
+    # ...replacing it (as a real /hydrate would) with a hydrated fake now routes there.
     _register("user-1")
     resp = client.post(
         "/query", json={"query": "hi"}, headers={"X-User-Id": "user-1"}
@@ -116,9 +123,15 @@ def test_query_is_isolated_between_users(client):
 
 def test_stats_routes_per_user(client):
     assert client.get("/stats").status_code == 400  # no X-User-Id
-    assert client.get("/stats", headers={"X-User-Id": "user-1"}).status_code == 503
+    # No unit yet -> lazily created real (empty, unhydrated) unit, not 503.
+    resp = client.get("/stats", headers={"X-User-Id": "user-1"})
+    assert resp.status_code == 200
+    assert resp.json()["is_hydrated"] is False
+    # Swap in a hydrated fake (as /hydrate would produce) -> stats now reflect it.
     _register("user-1")
-    assert client.get("/stats", headers={"X-User-Id": "user-1"}).status_code == 200
+    resp = client.get("/stats", headers={"X-User-Id": "user-1"})
+    assert resp.status_code == 200
+    assert resp.json()["is_hydrated"] is True
 
 
 # ── CORS allow-list ────────────────────────────────────────────

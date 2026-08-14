@@ -56,12 +56,30 @@ def test_resolve_requires_user_id(client):
     assert resp.status_code == 400
 
 
-def test_resolve_unknown_user_is_503(client):
+def test_resolve_for_user_with_no_unit_lazily_creates_and_returns_missing(client):
+    # A user who has never hydrated/learned has no unit yet -> the dependency now
+    # lazily creates one (a real, empty MemoryUnit) instead of 503ing; with nothing
+    # indexed it can't resolve anything, so every field comes back "missing".
     _register("user-1")
     resp = client.post(
         "/resolve", json={"fields": ["recipient"]}, headers={"X-User-Id": "user-2"}
     )
-    assert resp.status_code == 503
+    assert resp.status_code == 200, resp.text
+    slots = resp.json()["slots"]
+    assert slots == [
+        {
+            "field": "recipient",
+            "value": None,
+            "evidence": None,
+            "source": None,
+            "confidence": 0.0,
+            "scope": None,
+            "status": "missing",
+        }
+    ]
+    # And it's a real, distinct unit registered for user-2 — not user-1's fake.
+    assert "user-2" in api_module._memory_units
+    assert api_module._memory_units["user-2"] is not api_module._memory_units["user-1"]
 
 
 def test_resolve_routes_to_callers_unit(client):

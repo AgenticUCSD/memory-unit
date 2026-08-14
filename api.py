@@ -87,9 +87,10 @@ def _get_unit_for(
 ) -> Optional[MemoryUnit]:
     """Return this user's MemoryUnit (marking it most-recently-used).
 
-    ``create=True`` lazily builds and registers one (for /hydrate, /learn); otherwise
-    returns None when the user has no unit yet (read endpoints then 503). Evicts the
-    LRU unit if creating pushes the registry over ``MEMORY_MAX_USERS``.
+    ``create=True`` lazily builds and registers one (for /hydrate, /learn, and now
+    every read endpoint via ``require_user_unit``); otherwise returns None when the
+    user has no unit yet. Evicts the LRU unit if creating pushes the registry over
+    ``MEMORY_MAX_USERS``.
 
     When no ``persist_dir`` is given, fall back to ``MEMORY_PERSIST_DIR`` so a
     container can point storage at a writable path (Cloud Run: ``/tmp``) — the
@@ -109,6 +110,31 @@ def _get_unit_for(
             persist_dir=persist_dir, model_name=model_name, user_id=user_id
         )
         _memory_units[user_id] = unit
+
+        # Re-ingest this user's durable "learned" blocks (write-back facts persisted
+        # to the learned store, e.g. Postgres `planner.context_blocks`) right away,
+        # so a cold instance that has never hydrated this user from Drive can still
+        # serve resolve()/query() from what they already taught it. `_reload_learned`
+        # only touches attributes MemoryUnit.__init__ has already set (documents,
+        # vector_store, keyword_searcher, _learned_store), so it's safe immediately
+        # after construction — no I/O happens inside __init__ itself.
+        #
+        # Double-index check: the only other caller of `_reload_learned` is
+        # `hydrate_from_drive()` (core.py), and it always calls `self.clear()` first
+        # (wiping vector_store + keyword index + self.documents) before its own
+        # reload. So if this same unit later gets hydrated, that reload starts from a
+        # clean slate and this constructor-time reload can never combine with it —
+        # clear() is the reset point between the two call sites, so blocks reloaded
+        # here are never re-added on top of themselves.
+        #
+        # Best-effort: a learned-store read failure (e.g. Postgres blip) must degrade
+        # to an empty-but-usable unit, never break unit creation / turn a read into a
+        # 500 further up the call chain.
+        try:
+            unit._reload_learned()
+        except Exception as e:
+            logger.error(f"Failed to reload learned context for user {user_id} at unit creation: {e}")
+
         while len(_memory_units) > _max_users():
             evicted_id, _ = _memory_units.popitem(last=False)  # LRU
             logger.info("Evicted LRU memory unit (cap=%d)", _max_users())
@@ -271,14 +297,19 @@ def authed_user(
 
 
 def require_user_unit(user_id: str = Depends(authed_user)) -> MemoryUnit:
-    """Route to the authenticated caller's own MemoryUnit (503 until they /hydrate)."""
-    unit = _get_unit_for(user_id, create=False)
-    if unit is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Memory unit not initialized for this user. Call /hydrate first.",
-        )
-    return unit
+    """Route to the authenticated caller's own MemoryUnit, lazily creating one.
+
+    A cold instance (fresh process, or this user simply hasn't hit any endpoint yet)
+    used to 503 every read here until the caller ran /hydrate — but a user's durable
+    "learned" (write-back) context lives in the learned store independent of any
+    particular process, so there is no reason a read has to fail just because *this*
+    instance hasn't served them before. `_get_unit_for(create=True)` builds the unit
+    and re-ingests that learned context (see its docstring), so the unit this returns
+    can already answer resolve()/query() from write-back facts with zero Drive I/O.
+    A user who has never hydrated *and* never learned anything still gets a unit —
+    just an empty one, so reads return normal empty/`missing` results instead of 503.
+    """
+    return _get_unit_for(user_id, create=True)
 
 
 # =============================================================================

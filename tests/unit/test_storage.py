@@ -95,7 +95,13 @@ class TestVectorStore:
         ]
 
         store.add_documents(docs)
-        mock_collection.add.assert_called()
+        # upsert, not add: the collection persists across MemoryUnit rebuilds, so
+        # re-indexing a doc that carries a deterministic id (learned/write-back
+        # blocks) must overwrite in place instead of accumulating a duplicate.
+        mock_collection.upsert.assert_called()
+        mock_collection.add.assert_not_called()
+        _, kwargs = mock_collection.upsert.call_args
+        assert kwargs["ids"] == ["d1", "d2"]
 
     @patch("memory_unit.storage.vector_store.chromadb.PersistentClient")
     def test_query_documents(self, mock_chroma):

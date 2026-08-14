@@ -817,6 +817,12 @@ class MemoryUnit:
             doc_type=".txt",
             folder="machine_generated",
             chunk_index=0,
+            # Deterministic id, unlike the uuid4 default. _reload_learned() now runs
+            # on every unit construction (read-path lazy creation), not just after
+            # hydrate's clear(), so the same block can be re-indexed into a Chroma
+            # directory that already holds it. Keying on the content hash makes that
+            # re-index an idempotent upsert instead of an accumulating duplicate.
+            doc_id=f"learned-{record['hash']}",
         )
 
     def _index_documents(
