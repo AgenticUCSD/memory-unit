@@ -307,3 +307,77 @@ def test_resolve_min_coverage_parsing(monkeypatch):
     assert resolve_min_coverage() == 1.0          # clamped
     monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "-2")
     assert resolve_min_coverage() == 0.0          # clamped
+
+
+# ── single-token values the generic handling used to shred ────────────
+
+def test_extract_value_keeps_urls_and_iso_datetimes_whole():
+    mu = MemoryUnit.__new__(MemoryUnit)  # pure function; no init needed
+    cases = [
+        # A URL is one token. The clause splitter used to cut at the first dot,
+        # so EVERY url in a user's context came back truncated -- not just
+        # meeting links.
+        ("meeting_link", "Meeting link: https://meet.google.com/xyz-abcd-efg",
+         "https://meet.google.com/xyz-abcd-efg"),
+        ("doc_url", "Doc url: https://docs.google.com/document/d/abc.def/edit",
+         "https://docs.google.com/document/d/abc.def/edit"),
+        # An ISO datetime handed the number extractor a bare year, because the
+        # field name contains "time" and the numeric branch ran first.
+        ("time_window",
+         "Time window: 2026-07-16T14:00:00-07:00 to 2026-07-16T14:30:00-07:00",
+         "2026-07-16T14:00:00-07:00 to 2026-07-16T14:30:00-07:00"),
+        ("deadline", "Deadline: 2026-09-01", "2026-09-01"),
+    ]
+    for field, text, expected in cases:
+        assert mu._extract_value(field, text) == expected, field
+
+
+def test_extract_value_still_prefers_numbers_for_plain_durations():
+    # The ISO guard must not disable numeric extraction generally.
+    mu = MemoryUnit.__new__(MemoryUnit)
+    assert mu._extract_value("meeting_duration", "The meeting duration is 45 minutes.") == "45 minutes"
+    assert mu._extract_value("duration", "Duration: 30 minutes") == "30 minutes"
+
+
+def test_extract_value_still_splits_real_sentences():
+    # A period followed by a space is still a clause boundary.
+    mu = MemoryUnit.__new__(MemoryUnit)
+    assert mu._extract_value("cat", "vacation: beach. The cat is fluffy") == "fluffy"
+
+
+def test_extract_value_matches_field_names_by_word_not_substring():
+    """The link/datetime branches must not fire on a field that merely *contains*
+    one of their keywords.
+
+    "meet" is a substring of "meeting_duration" and "end" is a substring of
+    "attendees"/"agenda"/"sender"/"vendor"/"calendar_id". Since the link branch
+    runs before the numeric one, substring matching answered "how long is the
+    meeting?" with the Meet link sitting in the same snippet -- and any of the
+    "end" fields with whatever date appeared in theirs.
+    """
+    mu = MemoryUnit.__new__(MemoryUnit)
+
+    # "meet" inside "meeting_duration" must not divert to the link branch.
+    assert mu._extract_value(
+        "meeting_duration",
+        "Meeting duration is 30 minutes. Join: https://meet.google.com/abc-defg-hij",
+    ) == "30 minutes"
+
+    # "end" inside "attendees" must not divert to the datetime branch.
+    assert mu._extract_value(
+        "attendees",
+        "Attendees: alice@example.com and bob@example.com for the 2026-07-16 sync",
+    ) == "alice@example.com and bob@example.com for the 2026-07-16 sync"
+
+    # The branches still fire for the fields they are actually for.
+    assert mu._extract_value(
+        "meeting_link", "Meeting link: https://meet.google.com/xyz-abcd-efg"
+    ) == "https://meet.google.com/xyz-abcd-efg"
+    assert mu._extract_value("deadline", "Deadline: 2026-09-01") == "2026-09-01"
+
+
+def test_extract_value_finds_a_duration_that_shares_a_snippet_with_a_date():
+    # Blanking the ISO stamps must not disable numeric extraction for the rest of
+    # the text -- skipping the branch outright returned the whole sentence.
+    mu = MemoryUnit.__new__(MemoryUnit)
+    assert mu._extract_value("meeting_duration", "The 2026-07-16 sync is 30 minutes") == "30 minutes"

@@ -15,6 +15,22 @@ _NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 _CONNECTOR_RE = re.compile(r"(?:\bis\b|\bare\b|:|=)\s*(.+)", re.IGNORECASE)
+# A URL, and an ISO-8601 date or datetime (optionally with time + offset). Both are
+# single tokens that the generic clause/number handling below would otherwise
+# mangle: a URL gets cut at its first dot, and an ISO datetime hands the number
+# extractor a bare "2026". See _extract_value.
+_URL_RE = re.compile(r"https?://\S+")
+_ISO_DT_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+)
+# Sentence boundary: a period/semicolon only ends a clause when followed by
+# whitespace or end-of-string. Splitting on a bare "." shreds URLs and decimals.
+_CLAUSE_SPLIT_RE = re.compile(r"[.;](?=\s|$)|\n")
+# Field names split into words. The link/datetime branches in _extract_value must
+# match whole words, not substrings: "meet" is inside "meeting_duration" and "end"
+# is inside "attendees"/"agenda"/"sender"/"calendar_id"/"vendor", so substring
+# matching sends those fields down the wrong branch entirely.
+_FIELD_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
@@ -709,17 +725,45 @@ class MemoryUnit:
         if not text:
             return text
         field_l = field.lower()
+        field_words = set(_FIELD_TOKEN_RE.findall(field_l))
 
         if any(k in field_l for k in ("email", "recipient", "sender", "contact", "address")):
             m = _EMAIL_RE.search(text)
             if m:
                 return m.group(0)
 
+        # A link is one token. Without this the clause handling below cuts it at the
+        # first dot ("https://meet.google.com/xyz" -> "https://meet"), which affects
+        # every URL in a user's context, not just meeting links.
+        # Whole-word match only: "meet" is a substring of "meeting_duration", and this
+        # branch runs before the numeric one, so substring matching would answer a
+        # duration question with the Meet link that sits in the same snippet.
+        if field_words & {"link", "url", "href", "meet", "zoom", "webinar"}:
+            m = _URL_RE.search(text)
+            if m:
+                return m.group(0).rstrip(".,;")
+
+        # Likewise an ISO datetime, and a "<start> to <end>" range is a single value.
+        # This must precede the numeric branch: field names like `time_window`
+        # contain "time", so _pick_number would otherwise pull the bare year out of
+        # "2026-07-16T14:00:00-07:00" and return "2026".
+        # Whole-word match again: "end" is a substring of "attendees", "agenda",
+        # "sender", "calendar_id" and "vendor", all of which would otherwise return
+        # any date that happened to appear in their evidence.
+        if field_words & {"date", "time", "when", "deadline", "window", "start", "end"}:
+            stamps = list(_ISO_DT_RE.finditer(text))
+            if stamps:
+                return text[stamps[0].start():stamps[-1].end()]
+
         if any(
             k in field_l
             for k in ("duration", "length", "minutes", "time", "number", "count", "amount", "size", "budget")
         ):
-            num = self._pick_number(text)
+            # Blank out ISO stamps before picking, so a date sharing the snippet with
+            # a real duration cannot donate its year ("2026") as the answer. Removing
+            # just the stamps rather than skipping the branch keeps the duration
+            # findable: "The 2026-07-16 sync is 30 minutes" -> "30 minutes".
+            num = self._pick_number(_ISO_DT_RE.sub(" ", text))
             if num:
                 return num
 
@@ -735,12 +779,12 @@ class MemoryUnit:
         if head_match:
             m = _CONNECTOR_RE.search(text[head_match.start():])
             if m:
-                clause = re.split(r"[.;\n]", m.group(1))[0].strip()
+                clause = _CLAUSE_SPLIT_RE.split(m.group(1))[0].strip()
                 if clause:
                     return clause[:200]
 
         # Fallback: first sentence / trimmed snippet.
-        first = re.split(r"[.;\n]", text)[0].strip()
+        first = _CLAUSE_SPLIT_RE.split(text)[0].strip()
         return (first or text)[:200]
 
     def _pick_number(self, text: str) -> Optional[str]:
