@@ -23,6 +23,12 @@ _URL_RE = re.compile(r"https?://\S+")
 _ISO_DT_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
 )
+# An IANA zone name ("America/Los_Angeles") or a UTC/GMT offset ("UTC-8",
+# "GMT+5:30"). Must be pulled out whole and ahead of the numeric branch:
+# "timezone" contains "time" and "GMT+5:30"/"UTC-8" both contain digits, so
+# without this the numeric branch grabs the bare offset digit ("5", "8") and
+# throws away the sign and the rest of the value. See _extract_value.
+_TZ_RE = re.compile(r"(?:UTC|GMT)(?:[+-]\d{1,2}(?::?\d{2})?)?|[A-Za-z]+(?:/[A-Za-z_]+)+")
 # Sentence boundary: a period/semicolon only ends a clause when followed by
 # whitespace or end-of-string. Splitting on a bare "." shreds URLs and decimals.
 _CLAUSE_SPLIT_RE = re.compile(r"[.;](?=\s|$)|\n")
@@ -727,7 +733,22 @@ class MemoryUnit:
         field_l = field.lower()
         field_words = set(_FIELD_TOKEN_RE.findall(field_l))
 
-        if any(k in field_l for k in ("email", "recipient", "sender", "contact", "address")):
+        # "address" is deliberately NOT in the plain substring list below: it's
+        # ambiguous between an email address and a physical/IP address, and
+        # "home_address"/"street_address"/"ip_address" are all real field names.
+        # Verified: "Home address: 123 Main St. Contact jane@example.com for
+        # questions." with field "home_address" returned the unrelated email
+        # instead of the address before this guard. Only trust "address" when
+        # it's paired with "email"/"mail" in the same field name (e.g.
+        # "email_address", "mail_address") -- that pairing is unambiguous.
+        #
+        # The pairing is matched on WORDS, not substrings, or it reintroduces the
+        # very bug it exists to fix: "mail" is inside "mailing", so
+        # "mailing_address" -- a physical address -- would be read as an email
+        # field and return whatever unrelated address appeared in the snippet.
+        if any(k in field_l for k in ("email", "recipient", "sender", "contact")) or (
+            "address" in field_l and bool(field_words & {"email", "mail"})
+        ):
             m = _EMAIL_RE.search(text)
             if m:
                 return m.group(0)
@@ -755,7 +776,35 @@ class MemoryUnit:
             if stamps:
                 return text[stamps[0].start():stamps[-1].end()]
 
-        if any(
+        # Whole-word match, ahead of the numeric branch for the same reason as the
+        # link/date branches above: "timezone" contains "time" (numeric keyword)
+        # and its value ("GMT+5:30", "UTC-8") is itself digit-bearing, so without
+        # this the numeric branch wins and returns just "5" or "8". Verified live.
+        # "tz"/"zone" are included so "tz" and "time_zone" fields (whose own word
+        # split already includes "time" and would otherwise fall into the date
+        # branch first, harmlessly no-op there since it's not an ISO stamp) land
+        # here too.
+        if field_words & {"timezone", "tz", "zone"}:
+            m = _TZ_RE.search(text)
+            if m:
+                return m.group(0)
+
+        # Fields whose name contains the word "name" or "timeline" are
+        # identifiers/schedules, never bare quantities -- no legitimate field is
+        # called "duration_name", "count_name" or "count_timeline" -- so this
+        # guard only ever removes false positives. Verified live:
+        #   - "account_name" over "Account name: Acme Corp, 42 employees"
+        #     returned "42" (the "count" substring inside "account") instead of
+        #     "Acme Corp".
+        #   - "project_timeline" over "Project timeline: Q3 2026 launch, on
+        #     track" returned "2026" (the "time" substring inside "timeline")
+        #     instead of the "Q3 2026 launch, on track" clause.
+        # A blanket switch of this whole branch to word matching is NOT safe
+        # (see docstring note above this method / task notes): "timeout_seconds"
+        # word-splits to {"timeout", "seconds"}, losing "time", and would stop
+        # matching at all. So this is a narrow, additive exclusion, not a
+        # semantics change to the branch's matching strategy.
+        if not (field_words & {"name", "timeline"}) and any(
             k in field_l
             for k in ("duration", "length", "minutes", "time", "number", "count", "amount", "size", "budget")
         ):
