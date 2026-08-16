@@ -307,3 +307,163 @@ def test_resolve_min_coverage_parsing(monkeypatch):
     assert resolve_min_coverage() == 1.0          # clamped
     monkeypatch.setenv("MEMORY_RESOLVE_MIN_COVERAGE", "-2")
     assert resolve_min_coverage() == 0.0          # clamped
+
+
+# ── single-token values the generic handling used to shred ────────────
+
+def test_extract_value_keeps_urls_and_iso_datetimes_whole():
+    mu = MemoryUnit.__new__(MemoryUnit)  # pure function; no init needed
+    cases = [
+        # A URL is one token. The clause splitter used to cut at the first dot,
+        # so EVERY url in a user's context came back truncated -- not just
+        # meeting links.
+        ("meeting_link", "Meeting link: https://meet.google.com/xyz-abcd-efg",
+         "https://meet.google.com/xyz-abcd-efg"),
+        ("doc_url", "Doc url: https://docs.google.com/document/d/abc.def/edit",
+         "https://docs.google.com/document/d/abc.def/edit"),
+        # An ISO datetime handed the number extractor a bare year, because the
+        # field name contains "time" and the numeric branch ran first.
+        ("time_window",
+         "Time window: 2026-07-16T14:00:00-07:00 to 2026-07-16T14:30:00-07:00",
+         "2026-07-16T14:00:00-07:00 to 2026-07-16T14:30:00-07:00"),
+        ("deadline", "Deadline: 2026-09-01", "2026-09-01"),
+    ]
+    for field, text, expected in cases:
+        assert mu._extract_value(field, text) == expected, field
+
+
+def test_extract_value_still_prefers_numbers_for_plain_durations():
+    # The ISO guard must not disable numeric extraction generally.
+    mu = MemoryUnit.__new__(MemoryUnit)
+    assert mu._extract_value("meeting_duration", "The meeting duration is 45 minutes.") == "45 minutes"
+    assert mu._extract_value("duration", "Duration: 30 minutes") == "30 minutes"
+
+
+def test_extract_value_still_splits_real_sentences():
+    # A period followed by a space is still a clause boundary.
+    mu = MemoryUnit.__new__(MemoryUnit)
+    assert mu._extract_value("cat", "vacation: beach. The cat is fluffy") == "fluffy"
+
+
+def test_extract_value_matches_field_names_by_word_not_substring():
+    """The link/datetime branches must not fire on a field that merely *contains*
+    one of their keywords.
+
+    "meet" is a substring of "meeting_duration" and "end" is a substring of
+    "attendees"/"agenda"/"sender"/"vendor"/"calendar_id". Since the link branch
+    runs before the numeric one, substring matching answered "how long is the
+    meeting?" with the Meet link sitting in the same snippet -- and any of the
+    "end" fields with whatever date appeared in theirs.
+    """
+    mu = MemoryUnit.__new__(MemoryUnit)
+
+    # "meet" inside "meeting_duration" must not divert to the link branch.
+    assert mu._extract_value(
+        "meeting_duration",
+        "Meeting duration is 30 minutes. Join: https://meet.google.com/abc-defg-hij",
+    ) == "30 minutes"
+
+    # "end" inside "attendees" must not divert to the datetime branch.
+    assert mu._extract_value(
+        "attendees",
+        "Attendees: alice@example.com and bob@example.com for the 2026-07-16 sync",
+    ) == "alice@example.com and bob@example.com for the 2026-07-16 sync"
+
+    # The branches still fire for the fields they are actually for.
+    assert mu._extract_value(
+        "meeting_link", "Meeting link: https://meet.google.com/xyz-abcd-efg"
+    ) == "https://meet.google.com/xyz-abcd-efg"
+    assert mu._extract_value("deadline", "Deadline: 2026-09-01") == "2026-09-01"
+
+
+def test_extract_value_finds_a_duration_that_shares_a_snippet_with_a_date():
+    # Blanking the ISO stamps must not disable numeric extraction for the rest of
+    # the text -- skipping the branch outright returned the whole sentence.
+    mu = MemoryUnit.__new__(MemoryUnit)
+    assert mu._extract_value("meeting_duration", "The 2026-07-16 sync is 30 minutes") == "30 minutes"
+
+
+# ── the pre-existing branches had the same substring trap as the ones fixed
+# above, just with different keywords. Verified against the pre-fix code
+# before the fix landed: "timezone"/"account_name" both went through the
+# numeric branch ("time" is a substring of "timezone", "count" is a substring
+# of "account") and returned a bare digit stripped of its sign/context. ──
+
+def test_extract_value_keeps_a_timezone_offset_or_iana_name_whole():
+    mu = MemoryUnit.__new__(MemoryUnit)
+    # Pre-fix: "timezone" contains "time" (a numeric-branch keyword) and the
+    # value itself is digit-bearing, so the numeric branch won and returned
+    # just the offset's number, e.g. "5" or "8" -- sign, colon and all context
+    # gone. Verified failing pre-fix: both asserts below returned "5" / "8".
+    assert mu._extract_value("timezone", "Timezone: GMT+5:30") == "GMT+5:30"
+    assert mu._extract_value("timezone", "Timezone: UTC-8") == "UTC-8"
+    # This one happened to already pass pre-fix (no digits to steal), but it's
+    # worth pinning so a future change to the new branch doesn't regress it.
+    assert mu._extract_value("timezone", "Timezone: America/Los_Angeles") == "America/Los_Angeles"
+    # "tz" and "time_zone" are common spellings for the same field; make sure
+    # the word-set match (not just the literal string "timezone") covers them.
+    assert mu._extract_value("tz", "Tz: UTC-8") == "UTC-8"
+    assert mu._extract_value("time_zone", "Time zone: America/New_York") == "America/New_York"
+
+
+def test_extract_value_account_name_is_not_diverted_by_count_substring():
+    # Pre-fix: "count" is a substring of "account" ("ac" + "count"), so the
+    # numeric branch fired on "account_name" and returned "42" instead of the
+    # company name. Verified failing pre-fix: returned "42".
+    mu = MemoryUnit.__new__(MemoryUnit)
+    value = mu._extract_value("account_name", "Account name: Acme Corp, 42 employees")
+    assert value.startswith("Acme Corp")
+    assert value != "42"
+
+    # "headcount" is the mirror case: a real field where "count" *should* still
+    # win, and it's a single token so word-matching couldn't rescue it anyway --
+    # this is why the fix is a narrow "name"-word guard, not a switch to word
+    # matching for "count" itself.
+    assert mu._extract_value("headcount", "Headcount: 42 employees") == "42"
+
+
+def test_extract_value_timeline_is_not_diverted_by_time_substring():
+    # Pre-fix: "time" is a substring of "timeline", so the numeric branch fired
+    # on "project_timeline" and returned the bare year "2026" instead of the
+    # schedule text. Verified failing pre-fix: returned "2026".
+    mu = MemoryUnit.__new__(MemoryUnit)
+    value = mu._extract_value("project_timeline", "Project timeline: Q3 2026 launch, on track")
+    assert value != "2026"
+    assert "Q3 2026" in value
+
+    # "timeout_seconds" and "lifetime_value" are the mirror cases: real numeric
+    # fields whose own word ("timeout", "lifetime") also contains "time" as a
+    # substring, not a separate token. They must keep matching, which is why
+    # this fix excludes only the literal word "timeline" rather than touching
+    # "time" matching in general.
+    assert mu._extract_value("timeout_seconds", "Timeout seconds: 30 for the request") == "30"
+    assert mu._extract_value("lifetime_value", "Lifetime value: $4500 for this customer") == "4500"
+
+
+def test_extract_value_address_only_matches_email_when_paired_with_email_or_mail():
+    # Pre-fix: "address" alone was in the email branch's keyword list, so any
+    # field merely containing "address" -- including a physical mailing
+    # address -- searched the whole snippet for an email and returned it if
+    # one happened to appear anywhere in the same evidence text. Verified
+    # failing pre-fix: "home_address" returned "jane@example.com" instead of
+    # the street address.
+    mu = MemoryUnit.__new__(MemoryUnit)
+    assert mu._extract_value(
+        "home_address",
+        "Home address: 123 Main St. Contact jane@example.com for questions.",
+    ) == "123 Main St"
+
+    # "email_address" and "mail_address" are the intended targets of the
+    # "address" keyword and must still match.
+    assert mu._extract_value("email_address", "Email address: jane@example.com") == "jane@example.com"
+    assert mu._extract_value("mail_address", "Mail address: jane@example.com") == "jane@example.com"
+    assert mu._extract_value("contact_email", "Contact email: jane@example.com") == "jane@example.com"
+
+    # The email/mail pairing must itself be matched on WORDS. Matching it as a
+    # substring reintroduces exactly the bug this guard exists to fix, because
+    # "mail" is inside "mailing": a mailing address is a physical address, and
+    # the first cut of this guard returned "ops@example.com" for it.
+    assert mu._extract_value(
+        "mailing_address",
+        "Mailing address: 500 Oak Ave, Springfield. Reply to ops@example.com.",
+    ) == "500 Oak Ave, Springfield"
